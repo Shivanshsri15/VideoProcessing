@@ -1,0 +1,13 @@
+# M0: API service only. Infra (Mongo, Redis, S3, SMTP) stays external — added in later modules via env.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000

@@ -1,114 +1,146 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Video Processing Platform
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ), AWS S3 storage, and analytics APIs. **API-only** — no web UI.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Table of contents
 
-## Description
+- [Status / progress](#status--progress)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Setup & run](#setup--run)
+- [Environment variables](#environment-variables)
+- [API reference](#api-reference)
+- [Module changelog](#module-changelog)
+- [Project layout](#project-layout)
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Status / progress
 
-## Project setup
+| Module | Name | Status |
+|--------|------|--------|
+| **M0** | Scaffold (health, config, Docker API) | Done |
+| M1 | Auth & security (design → then implement) | Next — design session first |
+| M2 | Upload & AWS S3 | Pending |
+| M3 | Queue & status (+ worker in Compose) | Pending |
+| M4 | FFmpeg worker | Pending |
+| M5 | Email notifications | Pending |
+| M6 | Analytics | Pending |
+| M7 | Ops, tests, submission polish | Pending |
+| M8 | Bonus features | Pending (after core) |
 
-```bash
-$ npm install
+## Tech stack
+
+| Layer | Choice |
+|--------|--------|
+| API | NestJS + TypeScript |
+| Auth | JWT + Passport (M1) |
+| Database | MongoDB + Mongoose — external (M1) |
+| Queue | BullMQ + Redis — external (M3+) |
+| Storage | AWS S3 (M2) |
+| Media | FFmpeg / FFprobe (M2/M4) |
+| Email | Nodemailer → SMTP (M5) |
+| Containers | Docker Compose: **API only** in M0; worker added in M3 |
+
+## Architecture
+
+**M0 (current):** a single NestJS API process. Liveness via `GET /health`. Configuration via env / `.env`.
+
+```text
+Client ──► NestJS API (Compose: api)
+              └── GET /health
 ```
 
-## Compile and run the project
+Later modules introduce MongoDB, Redis, AWS S3, BullMQ worker, and FFmpeg. Compose will never host Mongo/Redis/S3 — only `api` and (from M3) `worker`.
+
+## Prerequisites
+
+- **Node.js 24.22.x** — pinned in [`.nvmrc`](.nvmrc) / [`.node-version`](.node-version) (same major/minor as the API Docker image)
+- **npm 11.19.1** — pinned via `packageManager` in `package.json` (enable with `corepack enable`)
+- Docker + Docker Compose (to run the API container)
+
+External MongoDB / Redis / AWS S3 / SMTP are **not** required for M0.
+
+Node and npm are pinned so `package-lock.json` and Docker `npm ci` stay aligned; collaborators should not need lockfile repair steps.
+
+## Setup & run
+
+### Local (without Docker)
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+# nvm / fnm / asdf will pick up .nvmrc
+corepack enable
+cp .env.example .env
+npm install
+npm run start:dev
 ```
 
-## Run tests
+Health check: [http://localhost:3000/health](http://localhost:3000/health)
+
+### Docker Compose (API only)
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+cp .env.example .env
+docker compose up --build
 ```
 
-## Deployment
+Same health URL: [http://localhost:3000/health](http://localhost:3000/health)
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+### Tests
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+npm run test
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+## Environment variables
 
-## Observability
+Copy [`.env.example`](.env.example). Variables introduced so far:
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NODE_ENV` | `development` | Runtime environment |
+| `PORT` | `3000` | HTTP port (host mapping uses this for Compose publish) |
 
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
+## API reference
 
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
+### `GET /health`
 
-## Resources
+Liveness probe. Does not check Mongo, Redis, or S3 (those come later).
 
-Check out a few resources that may come in handy when working with NestJS:
+**Response `200`**
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observer](https://observer.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```json
+{ "status": "ok" }
+```
 
-## Support
+## Module changelog
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+### M0 — Scaffold
 
-## Stay in touch
+- NestJS root app wired with `@nestjs/config`
+- `GET /health` liveness endpoint
+- `.env.example` (`PORT`, `NODE_ENV`)
+- `Dockerfile` for the API (`node:24.22` + Corepack npm `11.19.1`; lockfile committed in sync)
+- `.nvmrc` / `engines` / `packageManager` pin Node+npm for local and Docker
+- `docker-compose.yml` with **`api` service only**
+- This living README (TOC + progress tracker)
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+## Project layout
 
-## License
+```text
+videoProcessAssignment/
+├── src/
+│   ├── main.ts                 # bootstrap; reads PORT from ConfigService
+│   ├── app.module.ts           # ConfigModule + HealthModule
+│   └── health/
+│       ├── health.module.ts
+│       ├── health.controller.ts
+│       └── health.controller.spec.ts
+├── Dockerfile                  # API image (Node 24.22 + npm 11.19.1)
+├── docker-compose.yml          # api only (M0)
+├── .nvmrc / .node-version      # Node 24.22.2
+├── .npmrc                      # engine-strict
+├── .env.example
+├── package.json
+└── README.md
+```
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
