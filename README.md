@@ -17,6 +17,7 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
   - [JWT ID and token version use-case architecture](#jwt-id-and-token-version-use-case-architecture)
   - [Rate limiting strategy](#rate-limiting-strategy)
   - [Rate limiter](#rate-limiter)
+  - [Redis keys for rate limiting](#redis-keys-for-rate-limiting)
 - [Module changelog](#module-changelog)
 - [Project layout](#project-layout)
 
@@ -279,9 +280,41 @@ flowchart LR
   Guard -->|ok| Auth[AuthService]
 ```
 
-Counters use Redis keys prefixed with `rl:`. JWT ID denylist keys use `jwt:deny:` on the same Redis instance.
+**How the route is wired**
+
+- `@UseGuards(ThrottlerGuard)` (or `UserThrottlerGuard`) — runs the rate-limit check before the handler.
+- `@Throttle({ default: { limit, ttl } })` — sets **this route’s** limit/window (overrides the module default from `ThrottlerModule` in `AppModule`).
+- `ThrottlerModule.forRootAsync({ storage: RedisThrottlerStorage })` — the guard’s `storage.increment(...)` is our Redis implementation (there is no separate Redis “lookup” API; check = `INCR` then `count > limit`).
+
+### Redis keys for rate limiting
+
+**What is stored (rate limit only — not the JWT or user session)**
+
+| | |
+|--|--|
+| **Redis key** | `rl:<throttlerName>:<hash>` e.g. `rl:default:4f8fe074e4e8...` |
+| **Value** | Integer hit **counter** (`INCR`) |
+| **TTL** | Window length (~60s); key auto-deletes when TTL expires (bucket resets) |
+
+**How `<hash>` is generated** (Nest `ThrottlerGuard`, deterministic):
+
+1. **Tracker** — public auth: client IP (`req.ip`); protected auth: `user:<userId>` (fallback IP if no user).
+2. **Key material** — `AuthController-<handlerName>-default-<tracker>`  
+   Examples: `AuthController-login-default-127.0.0.1`, `AuthController-register-default-127.0.0.1`
+3. **Hash** — SHA-256 of that string → the hex suffix in Redis.
+4. **Our prefix** — `RedisThrottlerStorage` stores `rl:default:` + that hash.
+
+Same IP + same endpoint → **same Redis key** → shared counter.  
+Different endpoints (`login` vs `register`) → **different** handler name in step 2 → **different** keys (separate buckets).
+
+**Other Redis keys (not rate limiting)**
+
+| Key | Value | When |
+|-----|--------|------|
+| `jwt:deny:<jwt-id>` | `1` | Logout or change-password (TTL = remaining access-token life) |
 
 ---
+
 
 ## Module changelog
 
