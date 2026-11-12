@@ -27,6 +27,11 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 - [Queue & status (M3)](#queue--status-m3)
   - [Global concurrency](#global-concurrency)
   - [API vs worker connections](#api-vs-worker-connections)
+  - [Enqueue after upload](#enqueue-after-upload)
+  - [How BullMQ stores jobs in Redis](#how-bullmq-stores-jobs-in-redis)
+  - [How the worker picks up a job](#how-the-worker-picks-up-a-job)
+  - [M3 stub vs M4](#m3-stub-vs-m4)
+  - [Status cache vs BullMQ](#status-cache-vs-bullmq)
 - [Module changelog](#module-changelog)
 - [Project layout](#project-layout)
 
@@ -462,14 +467,122 @@ Upload/auth rate limits remain per-IP / per-user; they do not control processing
 
 ### API vs worker connections
 
-- **API** (`node dist/main.js`) — HTTP + BullMQ **producer**
-- **Worker** (`node dist/worker.main.js`) — BullMQ **consumer** only
-- Both use the same `REDIS_URL`, each with its **own** connections
+- **API** (`node dist/main.js`) — HTTP + BullMQ **producer** (`VideoQueueService`)
+- **Worker** (`node dist/worker.main.js`) — BullMQ **consumer** (`VideoProcessingProcessor`)
+- Both use the same `REDIS_URL`, each with its **own** TCP connections
 - BullMQ uses a dedicated connection (`maxRetriesPerRequest: null`); `RedisService` (rate limits / JWT denylist / status cache) stays separate
 
-M3 worker stub logs the job and `moveToDelayed` (~24h) so jobs stay pending without FFmpeg. M4 replaces that stub.
+```mermaid
+flowchart LR
+  subgraph apiProc [API_process]
+    Upload[VideosService.handleUpload]
+    Enq[VideoQueueService.enqueue]
+    Upload --> Enq
+  end
+  subgraph redisBox [Redis]
+    BullKeys[BullMQ_lists_and_hashes]
+    StatusKey["task:status:taskId"]
+  end
+  subgraph workerProc [Worker_process]
+    Proc[VideoProcessingProcessor]
+  end
+  Enq -->|Queue.add| BullKeys
+  Proc -->|BRPOPLPUSH_style_claim| BullKeys
+  Upload --> StatusKey
+```
 
-Redis status cache key: `task:status:{taskId}` (TTL from `TASK_STATUS_CACHE_TTL_SEC`).
+### Enqueue after upload
+
+After S3 put + Mongo `video_tasks` create (`status: queued`):
+
+1. Write Redis status snapshot `task:status:{taskId}`.
+2. `videoQueue.add('process-video', { taskId, userId, s3Key }, { jobId: taskId })`.
+
+`jobId = taskId` keeps **one BullMQ job per task** (idempotent if the same id is added again).
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as API
+  participant M as Mongo
+  participant R as Redis
+  participant B as BullMQ_in_Redis
+
+  C->>A: POST /api/videos/upload
+  A->>M: create video_tasks queued
+  A->>R: SET task:status:taskId
+  A->>B: add process-video jobId=taskId
+  A-->>C: taskId status queued etaSeconds
+  Note over B: Job sits in waiting until a worker claims it
+```
+
+### How BullMQ stores jobs in Redis
+
+BullMQ does **not** use our `task:status:*` keys for the queue. It manages its own keyspace for queue `video-processing` (prefix typically `bull:video-processing:`), including:
+
+| Concept | Role |
+|---------|------|
+| Job hash | Payload + metadata for one job (`taskId`, `userId`, `s3Key`, attempts, …) |
+| **Waiting** list | Jobs ready to run, ordered so the next claim is FIFO |
+| **Active** list | Jobs currently locked by a worker |
+| Delayed / completed / failed | Other lifecycle sets/lists |
+
+When the API calls `Queue.add`, BullMQ creates the job record and **pushes the job id onto the waiting list**. That is the “enqueue into Redis” step.
+
+### How the worker picks up a job
+
+The worker process boots Nest `WorkerModule`, which registers `@Processor('video-processing', { concurrency: 1 })`. Under the hood BullMQ’s **Worker**:
+
+1. Connects to the same Redis with a dedicated client.
+2. **Blocks / polls** the queue’s waiting structure (atomic move waiting → active with a lock token).
+3. With `concurrency: 1`, it only holds **one** active job at a time for the whole system.
+4. Deserializes the job and calls our `VideoProcessingProcessor.process(job)`.
+5. On success → completed; on throw → failed/retry; M3 stub uses `moveToDelayed` so the job leaves active without finishing FFmpeg.
+
+Important: the worker does **not** “subscribe to the latest upload HTTP request.” It only watches Redis. New uploads become visible as soon as they appear on the waiting list; the next free concurrency slot claims the **oldest waiting** job (FIFO), not “whichever user just uploaded.”
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant Redis as Redis_BullMQ
+  participant P as VideoProcessingProcessor
+
+  loop While_worker_running
+    W->>Redis: claim next waiting job atomic
+    alt Slot free concurrency 1
+      Redis-->>W: jobId plus payload
+      W->>P: process job
+      Note over P: M3 stub delays job; M4 runs FFmpeg
+      P-->>W: done or delayed or failed
+      W->>Redis: move job to completed delayed or failed
+    else Already busy
+      Redis-->>W: wait until active job finishes
+    end
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> waiting: API_Queue.add
+  waiting --> active: Worker_claims
+  active --> delayed: M3_stub_moveToDelayed
+  active --> completed: M4_success
+  active --> failed: processing_error
+  delayed --> waiting: delay_expires
+```
+
+### M3 stub vs M4
+
+M3 `VideoProcessingProcessor` logs the job and `moveToDelayed` (~24h) so jobs stay pending **without** FFmpeg and the concurrency slot is released. M4 replaces that body with download → transcode → thumbnail → `completed` / `failed`.
+
+### Status cache vs BullMQ
+
+| Redis use | Key pattern | Purpose |
+|-----------|-------------|---------|
+| Status cache (ours) | `task:status:{taskId}` | Fast `GET` status/progress for the API |
+| BullMQ (library) | `bull:video-processing:*` | Waiting/active job orchestration |
+
+Mongo `video_tasks` remains the durable task record. Cache TTL: `TASK_STATUS_CACHE_TTL_SEC` (default 24h).
 
 ---
 
