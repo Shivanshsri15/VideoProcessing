@@ -10,7 +10,7 @@ async function bootstrap() {
   });
   app.enableShutdownHooks();
   logger.log(
-    `Video worker started (global concurrency=${VIDEO_WORKER_CONCURRENCY}; FFmpeg in M4)`,
+    `Video worker started (global concurrency=${VIDEO_WORKER_CONCURRENCY})`,
   );
 }
 

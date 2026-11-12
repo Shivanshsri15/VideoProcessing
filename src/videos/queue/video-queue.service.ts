@@ -20,6 +20,7 @@ export class VideoQueueService {
   ): Promise<void> => {
     await this.videoQueue.add(PROCESS_VIDEO_JOB_NAME, payload, {
       jobId: payload.taskId,
+      attempts: 1,
       removeOnComplete: false,
       removeOnFail: false,
     });

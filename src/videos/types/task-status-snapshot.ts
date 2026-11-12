@@ -11,4 +11,8 @@ export type TaskStatusSnapshot = {
   metadata: VideoTaskMetadata;
   updatedAt: string;
   failureReason?: string;
+  outputKey?: string;
+  thumbnailKey?: string;
+  startedAt?: string;
+  completedAt?: string;
 };

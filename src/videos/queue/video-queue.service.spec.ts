@@ -23,6 +23,7 @@ describe('VideoQueueService', () => {
 
     expect(add).toHaveBeenCalledWith(PROCESS_VIDEO_JOB_NAME, payload, {
       jobId: 'task-1',
+      attempts: 1,
       removeOnComplete: false,
       removeOnFail: false,
     });

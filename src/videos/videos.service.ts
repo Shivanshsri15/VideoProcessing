@@ -33,6 +33,7 @@ import { StatusCacheService } from './status-cache.service.js';
 import type { TaskProgressResult } from './types/task-progress.js';
 import type { TaskStatusSnapshot } from './types/task-status-snapshot.js';
 import type { UploadResult } from './types/upload-result.js';
+import { buildTaskStatusSnapshot } from './utils/task-snapshot.util.js';
 
 @Injectable()
 export class VideosService {
@@ -97,7 +98,7 @@ export class VideosService {
         etaSeconds,
       });
 
-      const snapshot = this.toSnapshot(task);
+      const snapshot = buildTaskStatusSnapshot(task);
       await this.statusCache.set(snapshot);
 
       try {
@@ -114,7 +115,7 @@ export class VideosService {
         task.status = 'failed';
         task.failureReason = 'Failed to enqueue processing job';
         await task.save();
-        await this.statusCache.set(this.toSnapshot(task));
+        await this.statusCache.set(buildTaskStatusSnapshot(task));
         throw new InternalServerErrorException('Upload failed');
       }
 
@@ -159,7 +160,7 @@ export class VideosService {
       .limit(safeLimit)
       .exec();
 
-    return tasks.map((task) => this.toSnapshot(task));
+    return tasks.map((task) => buildTaskStatusSnapshot(task));
   };
 
   getTask = async (
@@ -176,7 +177,7 @@ export class VideosService {
     }
 
     const task = await this.findOwnedTaskOrThrow(user.id, taskId);
-    const snapshot = this.toSnapshot(task);
+    const snapshot = buildTaskStatusSnapshot(task);
     await this.statusCache.set(snapshot);
     return snapshot;
   };
@@ -192,6 +193,17 @@ export class VideosService {
       progress: snapshot.progress,
       etaSeconds: snapshot.etaSeconds,
     };
+  };
+
+  getThumbnail = async (
+    user: AuthenticatedUser,
+    taskId: string,
+  ): Promise<Buffer> => {
+    const task = await this.findOwnedTaskOrThrow(user.id, taskId);
+    if (task.status !== 'completed' || !task.thumbnailKey) {
+      throw new NotFoundException('Thumbnail not found');
+    }
+    return this.s3.getObjectBuffer(task.thumbnailKey);
   };
 
   private isOwnedByUser = async (
@@ -221,28 +233,5 @@ export class VideosService {
       throw new NotFoundException('Task not found');
     }
     return task;
-  };
-
-  private toSnapshot = (task: VideoTaskDocument): TaskStatusSnapshot => {
-    const updatedAt =
-      task.updatedAt instanceof Date
-        ? task.updatedAt.toISOString()
-        : new Date().toISOString();
-
-    const snapshot: TaskStatusSnapshot = {
-      taskId: task.taskId,
-      status: task.status,
-      progress: task.progress,
-      etaSeconds: task.etaSeconds,
-      s3Key: task.s3Key,
-      metadata: { durationSec: task.metadata.durationSec },
-      updatedAt,
-    };
-
-    if (task.failureReason) {
-      snapshot.failureReason = task.failureReason;
-    }
-
-    return snapshot;
   };
 }

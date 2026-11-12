@@ -30,8 +30,11 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
   - [Enqueue after upload](#enqueue-after-upload)
   - [How BullMQ stores jobs in Redis](#how-bullmq-stores-jobs-in-redis)
   - [How the worker picks up a job](#how-the-worker-picks-up-a-job)
-  - [M3 stub vs M4](#m3-stub-vs-m4)
   - [Status cache vs BullMQ](#status-cache-vs-bullmq)
+- [FFmpeg worker (M4)](#ffmpeg-worker-m4)
+  - [Processing pipeline](#processing-pipeline)
+  - [S3 layout](#s3-layout)
+  - [Status and cache during processing](#status-and-cache-during-processing)
 - [Module changelog](#module-changelog)
 - [Project layout](#project-layout)
 
@@ -43,7 +46,7 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 | **M1** | Auth & security | Done |
 | **M2** | Upload & AWS S3 | Done |
 | **M3** | Queue & status (+ worker in Compose) | Done |
-| M4 | FFmpeg worker | Pending |
+| **M4** | FFmpeg worker | Done |
 | M5 | Email notifications | Pending |
 | M6 | Analytics | Pending |
 | M7 | Ops, tests, submission polish | Pending |
@@ -59,24 +62,24 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 | Cache / rate limit / denylist | Redis in Docker Compose |
 | Queue | BullMQ + Redis (shared queue; worker concurrency **1**) |
 | Storage | **AWS S3** (upload originals in M2) |
-| Media | **FFprobe** at upload (ETA); FFmpeg worker in M4 |
+| Media | **FFprobe** at upload (ETA); **FFmpeg** in worker (MP4 + thumbnail) |
 | Email | Nodemailer → SMTP (M5) |
 | Containers | Compose: **`api` + `redis` + `worker`** |
 
 ## Architecture
 
-**M3 (current):** upload → FFprobe → S3 → Mongo `video_tasks` → Redis status cache → BullMQ enqueue. Separate **worker** process runs with **global concurrency 1**; FFmpeg body is still a stub until M4.
+**M4 (current):** upload → FFprobe → S3 original → Mongo + status cache → BullMQ enqueue → worker (concurrency **1**) downloads, FFmpeg transcodes to MP4, writes thumbnail, updates status/progress.
 
 ```text
 Client ──► NestJS API (Compose: api)
               ├── MongoDB (users + video_tasks)
               ├── Redis (denylist + rate limits + task:status cache)
               ├── FFprobe (duration → etaSeconds)
-              ├── AWS S3 (original video bytes)
+              ├── AWS S3 (originals/ + thumbnails/)
               └── BullMQ producer (enqueue process-video, jobId=taskId)
 
          NestJS Worker (Compose: worker, concurrency 1)
-              └── BullMQ consumer (M3 stub holds jobs; M4 = FFmpeg)
+              └── VideoProcessingService (FFmpeg MP4 + thumb + status updates)
 ```
 
 ## Prerequisites
@@ -146,9 +149,11 @@ See [`.env.example`](.env.example).
 | `AWS_ACCESS_KEY_ID` | — | IAM access key |
 | `AWS_SECRET_ACCESS_KEY` | — | IAM secret |
 | `S3_BUCKET` | — | Bucket for originals |
-| `S3_ORIGINAL_PREFIX` | `originals/` | Key prefix |
+| `S3_ORIGINAL_PREFIX` | `originals/` | Original + processed MP4 prefix |
+| `S3_THUMBNAIL_PREFIX` | `thumbnails/` | Thumbnail JPEG prefix |
 | `MAX_UPLOAD_BYTES` | `524288000` | 500MB cap |
 | `FFPROBE_PATH` | `ffprobe` | FFprobe binary |
+| `FFMPEG_PATH` | `ffmpeg` | FFmpeg binary (worker) |
 | `VIDEO_QUEUE_NAME` | `video-processing` | Shared BullMQ queue (all users) |
 | `VIDEO_WORKER_CONCURRENCY` | `1` | **System-wide** processing concurrency |
 | `TASK_STATUS_CACHE_TTL_SEC` | `86400` | Redis `task:status:*` TTL |
@@ -206,7 +211,7 @@ Denylists current **JWT ID** in Redis. `200` → `{ "message": "Logged out" }`
 }
 ```
 
-Upload also **enqueues** a BullMQ job (`jobId = taskId`) and writes a Redis status snapshot. Multiple uploads are allowed (rate-limited); **processing** is system-wide concurrency **1** (not per-user). M3 worker stub holds jobs pending; real FFmpeg is M4.
+Upload also **enqueues** a BullMQ job (`jobId = taskId`) and writes a Redis status snapshot. Multiple uploads are allowed (rate-limited); **processing** is system-wide concurrency **1** (not per-user). The worker runs FFmpeg (MP4 + thumbnail) and updates progress.
 
 #### `GET /api/videos/tasks` (Bearer JWT)
 
@@ -222,13 +227,17 @@ Owner-only task status (Redis cache with Mongo fallback). `404` if missing or no
 ```json
 {
   "taskId": "uuid",
-  "status": "queued",
-  "progress": 0,
+  "status": "processing",
+  "progress": 45,
   "etaSeconds": 30
 }
 ```
 
-Progress stays `0` until M4 updates it during FFmpeg.
+Progress is updated by the worker during FFmpeg (~every 5%).
+
+#### `GET /api/videos/tasks/:taskId/thumbnail` (Bearer JWT)
+
+Returns `image/jpeg` when the task is `completed` and a thumbnail exists. `404` otherwise.
 
 ---
 
@@ -446,9 +455,12 @@ Minimal document:
 | `status` | `queued` \| `processing` \| `completed` \| `failed` \| `cancelled` |
 | `s3Key` | S3 object key (root field) |
 | `metadata` | `{ durationSec }` only |
-| `progress` | `0` until M4 |
+| `progress` | `0–100` (worker updates) |
 | `etaSeconds` | Estimate at submit |
-| `failureReason` | Set if enqueue fails (M3) |
+| `failureReason` | Enqueue/processing failure message |
+| `outputKey` | Processed MP4 S3 key |
+| `thumbnailKey` | Thumbnail JPEG S3 key |
+| `startedAt` / `completedAt` | Processing timing |
 | `createdAt` / `updatedAt` | Timestamps |
 
 ---
@@ -536,25 +548,28 @@ The worker process boots Nest `WorkerModule`, which registers `@Processor('video
 1. Connects to the same Redis with a dedicated client.
 2. **Blocks / polls** the queue’s waiting structure (atomic move waiting → active with a lock token).
 3. With `concurrency: 1`, it only holds **one** active job at a time for the whole system.
-4. Deserializes the job and calls our `VideoProcessingProcessor.process(job)`.
-5. On success → completed; on throw → failed/retry; M3 stub uses `moveToDelayed` so the job leaves active without finishing FFmpeg.
+4. Deserializes the job and calls `VideoProcessingProcessor` → `VideoProcessingService.processJob`.
+5. On success → BullMQ completed; on failure → Mongo `failed` + UnrecoverableError (no endless retries; enqueue uses `attempts: 1`).
 
-Important: the worker does **not** “subscribe to the latest upload HTTP request.” It only watches Redis. New uploads become visible as soon as they appear on the waiting list; the next free concurrency slot claims the **oldest waiting** job (FIFO), not “whichever user just uploaded.”
+Important: the worker does **not** “subscribe to the latest upload HTTP request.” It only watches Redis. New uploads become visible as soon as they appear on the waiting list; the next free concurrency slot claims the **oldest waiting** job (FIFO).
 
 ```mermaid
 sequenceDiagram
   participant W as Worker
   participant Redis as Redis_BullMQ
   participant P as VideoProcessingProcessor
+  participant S as VideoProcessingService
 
   loop While_worker_running
     W->>Redis: claim next waiting job atomic
     alt Slot free concurrency 1
       Redis-->>W: jobId plus payload
       W->>P: process job
-      Note over P: M3 stub delays job; M4 runs FFmpeg
-      P-->>W: done or delayed or failed
-      W->>Redis: move job to completed delayed or failed
+      P->>S: processJob payload
+      Note over S: FFmpeg MP4 plus thumbnail
+      S-->>P: done or failed
+      P-->>W: resolve or throw
+      W->>Redis: move job to completed or failed
     else Already busy
       Redis-->>W: wait until active job finishes
     end
@@ -565,15 +580,9 @@ sequenceDiagram
 stateDiagram-v2
   [*] --> waiting: API_Queue.add
   waiting --> active: Worker_claims
-  active --> delayed: M3_stub_moveToDelayed
-  active --> completed: M4_success
+  active --> completed: FFmpeg_success
   active --> failed: processing_error
-  delayed --> waiting: delay_expires
 ```
-
-### M3 stub vs M4
-
-M3 `VideoProcessingProcessor` logs the job and `moveToDelayed` (~24h) so jobs stay pending **without** FFmpeg and the concurrency slot is released. M4 replaces that body with download → transcode → thumbnail → `completed` / `failed`.
 
 ### Status cache vs BullMQ
 
@@ -586,14 +595,85 @@ Mongo `video_tasks` remains the durable task record. Cache TTL: `TASK_STATUS_CAC
 
 ---
 
+## FFmpeg worker (M4)
+
+One shared queue, one worker replica, BullMQ `{ concurrency: 1 }`. All pipeline logic lives in `VideoProcessingService`; the processor is only the BullMQ adapter.
+
+### Processing pipeline
+
+```mermaid
+sequenceDiagram
+  participant Q as BullMQ
+  participant S as VideoProcessingService
+  participant M as Mongo
+  participant R as Redis
+  participant S3 as AWS_S3
+  participant FF as FFmpeg
+
+  Q->>S: processJob taskId userId s3Key
+  S->>M: status processing progress 0 startedAt
+  S->>R: SET task:status:taskId
+  S->>S3: GetObject original
+  S->>FF: transcode H264 AAC output.mp4
+  loop Progress about every 5 percent
+    S->>M: progress N
+    S->>R: refresh cache
+  end
+  S->>FF: extract thumb.jpg
+  S->>S3: PutObject originals/.../output.mp4
+  S->>S3: PutObject thumbnails/.../thumb.jpg
+  S->>M: status completed progress 100 keys
+  S->>R: refresh cache
+```
+
+### S3 layout
+
+Same `userId` / `taskId`, **separate** thumbnail prefix:
+
+```text
+originals/{userId}/{taskId}/{originalFilename}
+originals/{userId}/{taskId}/output.mp4
+thumbnails/{userId}/{taskId}/thumb.jpg
+```
+
+```mermaid
+flowchart TB
+  taskId[taskId]
+  taskId --> orig["originals/userId/taskId/"]
+  taskId --> thumbs["thumbnails/userId/taskId/"]
+  orig --> file[original upload]
+  orig --> mp4[output.mp4]
+  thumbs --> jpg[thumb.jpg]
+```
+
+### Status and cache during processing
+
+| Step | Mongo | Redis `task:status:{taskId}` |
+|------|--------|------------------------------|
+| Job start | `processing`, `progress: 0`, `startedAt` | Refreshed |
+| FFmpeg progress | `progress` ~every 5% | Refreshed |
+| Success | `completed`, `100`, `outputKey`, `thumbnailKey`, `completedAt` | Refreshed |
+| Failure | `failed`, `failureReason` | Refreshed |
+
+Poll `GET /api/videos/tasks/:taskId/progress` while processing; fetch `GET .../thumbnail` after `completed`.
+
+**Note:** Jobs delayed by the old M3 stub may still sit in BullMQ delayed until the delay expires; flush the Redis BullMQ keys or wait before retesting locally.
+
+---
+
 ## Module changelog
+
+### M4 — FFmpeg worker
+
+- Worker runs FFmpeg: download original → MP4 + JPEG thumbnail → S3
+- Progress updates (~5%) on Mongo + status cache; `GET .../thumbnail`
+- Single `VideoProcessingService`; global concurrency still 1
 
 ### M3 — Queue & status
 
 - BullMQ enqueue after upload (`jobId = taskId`); Redis `task:status:*` cache
 - `GET /api/videos/tasks`, `GET /api/videos/tasks/:taskId`, `GET .../progress`
 - Compose **`worker`** + `start:worker` / `start:worker:dev`; global concurrency **1**
-- Processor stub holds jobs for M4 FFmpeg (no transcode yet)
 
 ### M2 — Upload & AWS S3
 
@@ -625,7 +705,8 @@ videoProcessAssignment/
 │   ├── health/
 │   ├── redis/
 │   ├── queue/                  # shared BullMQ connection + job types
-│   ├── worker/                 # consumer module + processing processor
+│   ├── worker/                 # consumer + VideoProcessingService (FFmpeg)
+│   │   └── processing/
 │   ├── users/
 │   ├── auth/
 │   ├── s3/                     # AWS S3 client

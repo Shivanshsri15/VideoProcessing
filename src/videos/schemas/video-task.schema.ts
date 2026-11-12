@@ -45,6 +45,18 @@ export class VideoTask {
   @Prop({ required: false })
   failureReason?: string;
 
+  @Prop({ required: false })
+  outputKey?: string;
+
+  @Prop({ required: false })
+  thumbnailKey?: string;
+
+  @Prop({ type: Date, required: false })
+  startedAt?: Date;
+
+  @Prop({ type: Date, required: false })
+  completedAt?: Date;
+
   createdAt!: Date;
   updatedAt!: Date;
 }

@@ -3,11 +3,18 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { QueueModule } from '../queue/queue.module.js';
 import { RedisModule } from '../redis/redis.module.js';
+import { S3Module } from '../s3/s3.module.js';
+import {
+  VideoTask,
+  VideoTaskSchema,
+} from '../videos/schemas/video-task.schema.js';
+import { StatusCacheService } from '../videos/status-cache.service.js';
 import { VideoProcessingProcessor } from './processing/video-processing.processor.js';
+import { VideoProcessingService } from './processing/video-processing.service.js';
 
 /**
  * Worker process: BullMQ consumer only (no HTTP).
- * FFmpeg work lands in M4 inside VideoProcessingProcessor.
+ * FFmpeg pipeline lives in VideoProcessingService.
  */
 @Module({
   imports: [
@@ -22,9 +29,17 @@ import { VideoProcessingProcessor } from './processing/video-processing.processo
         uri: config.getOrThrow<string>('MONGODB_URI'),
       }),
     }),
+    MongooseModule.forFeature([
+      { name: VideoTask.name, schema: VideoTaskSchema },
+    ]),
     RedisModule,
     QueueModule,
+    S3Module,
   ],
-  providers: [VideoProcessingProcessor],
+  providers: [
+    StatusCacheService,
+    VideoProcessingService,
+    VideoProcessingProcessor,
+  ],
 })
 export class WorkerModule {}

@@ -4,5 +4,9 @@
  */
 export const VIDEO_WORKER_CONCURRENCY = 1;
 
-/** M3 stub: hold jobs pending until M4 FFmpeg (ms). */
-export const M3_STUB_DELAY_MS = 24 * 60 * 60 * 1000;
+export const FFMPEG_DEFAULT_PATH = 'ffmpeg';
+
+/** Persist progress to Mongo at this percent step. */
+export const PROGRESS_UPDATE_STEP_PERCENT = 20;
+
+export const CACHE_UPDATE_STEP_PERCENT = 5;

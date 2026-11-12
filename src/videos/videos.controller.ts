@@ -1,11 +1,13 @@
 import {
   Controller,
   Get,
+  Header,
   HttpCode,
   HttpStatus,
   Param,
   Post,
   Query,
+  StreamableFile,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -77,7 +79,7 @@ export class VideosController {
     return this.videosService.getTask(user, taskId);
   }
 
-  /** Progress snapshot for a task (progress stays 0 until M4). */
+  /** Progress snapshot for a task. */
   @Get('tasks/:taskId/progress')
   @UseGuards(JwtAuthGuard, UserThrottlerGuard)
   getTaskProgress(
@@ -85,5 +87,17 @@ export class VideosController {
     @Param('taskId') taskId: string,
   ) {
     return this.videosService.getTaskProgress(user, taskId);
+  }
+
+  /** Stream the generated JPEG thumbnail (owner-only; available when completed). */
+  @Get('tasks/:taskId/thumbnail')
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  @Header('Content-Type', 'image/jpeg')
+  async getThumbnail(
+    @GetUser() user: AuthenticatedUser,
+    @Param('taskId') taskId: string,
+  ): Promise<StreamableFile> {
+    const buffer = await this.videosService.getThumbnail(user, taskId);
+    return new StreamableFile(buffer);
   }
 }
