@@ -18,6 +18,12 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
   - [Rate limiting strategy](#rate-limiting-strategy)
   - [Rate limiter](#rate-limiter)
   - [Redis keys for rate limiting](#redis-keys-for-rate-limiting)
+- [Upload & storage (M2)](#upload--storage-m2)
+  - [Upload architecture](#upload-architecture)
+  - [Why AWS S3](#why-aws-s3)
+  - [Pros and cons](#pros-and-cons)
+  - [CDN notes](#cdn-notes)
+  - [`video_tasks` schema](#video_tasks-schema)
 - [Module changelog](#module-changelog)
 - [Project layout](#project-layout)
 
@@ -27,7 +33,7 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 |--------|------|--------|
 | **M0** | Scaffold (health, config, Docker API) | Done |
 | **M1** | Auth & security | Done |
-| M2 | Upload & AWS S3 | Pending |
+| **M2** | Upload & AWS S3 | Done |
 | M3 | Queue & status (+ worker in Compose) | Pending |
 | M4 | FFmpeg worker | Pending |
 | M5 | Email notifications | Pending |
@@ -44,19 +50,21 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 | Database | **Cloud MongoDB** via `MONGODB_URI` (Mongoose) |
 | Cache / rate limit / denylist | Redis in Docker Compose |
 | Queue | BullMQ + Redis (M3+) |
-| Storage | AWS S3 (M2) |
-| Media | FFmpeg / FFprobe (M2/M4) |
+| Storage | **AWS S3** (upload originals in M2) |
+| Media | **FFprobe** at upload (ETA); FFmpeg worker in M4 |
 | Email | Nodemailer → SMTP (M5) |
 | Containers | Compose: **`api` + `redis`** (M1); worker in M3 |
 
 ## Architecture
 
-**M1 (current):** NestJS API authenticates users against cloud MongoDB; Redis holds JWT ID denylist entries and rate-limit counters.
+**M2 (current):** authenticated upload → FFprobe (ETA) → S3 object + minimal `video_tasks` row. Auth/rate-limit still use MongoDB + Redis. Processing queue/worker is **not** started yet (M3/M4).
 
 ```text
 Client ──► NestJS API (Compose: api)
-              ├── MongoDB (cloud via MONGODB_URI)
-              └── Redis (Compose: redis)
+              ├── MongoDB (users + video_tasks)
+              ├── Redis (denylist + rate limits)
+              ├── FFprobe (duration → etaSeconds)
+              └── AWS S3 (original video bytes)
 ```
 
 ## Prerequisites
@@ -64,19 +72,21 @@ Client ──► NestJS API (Compose: api)
 - **Node.js 24.22.x** — pinned in [`.nvmrc`](.nvmrc) / [`.node-version`](.node-version)
 - **npm 11.19.1** — `packageManager` in `package.json` (`corepack enable`)
 - Docker + Docker Compose (API + Redis)
-- A **cloud MongoDB** connection string (Atlas or similar)
+- **cloud MongoDB** URI
+- **AWS S3** bucket + credentials
+- **FFprobe** on PATH for local `npm run start:dev` (Compose API image installs `ffmpeg`)
 
 ## Setup & run
 
-1. Copy env and set your cloud MongoDB URI:
+1. Copy env and fill secrets:
 
 ```bash
 cp .env.example .env
-# Edit .env → MONGODB_URI=your cloud connection string
-# Edit .env → JWT_SECRET=a-long-random-secret
+# MONGODB_URI, JWT_SECRET
+# AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET
 ```
 
-2. Allow your machine (or `0.0.0.0/0` for demos) in the MongoDB network access list.
+2. Allow your machine in the MongoDB network access list; ensure the IAM user can `s3:PutObject` on the bucket.
 
 ### Local API + Compose Redis
 
@@ -118,8 +128,15 @@ See [`.env.example`](.env.example).
 | `THROTTLE_LIMIT` | `60` | Default requests per window |
 | `THROTTLE_AUTH_LIMIT` | `10` | Documented public-auth limit (wired via `@Throttle` on routes) |
 | `THROTTLE_USER_LIMIT` | `20` | Documented protected-auth limit |
+| `AWS_REGION` | e.g. `ap-south-1` | S3 region |
+| `AWS_ACCESS_KEY_ID` | — | IAM access key |
+| `AWS_SECRET_ACCESS_KEY` | — | IAM secret |
+| `S3_BUCKET` | — | Bucket for originals |
+| `S3_ORIGINAL_PREFIX` | `originals/` | Key prefix |
+| `MAX_UPLOAD_BYTES` | `524288000` | 500MB cap |
+| `FFPROBE_PATH` | `ffprobe` | FFprobe binary |
 
-Never commit real MongoDB credentials. `.env` is gitignored.
+Never commit real credentials. `.env` is gitignored.
 
 ## API reference
 
@@ -151,6 +168,28 @@ Increments **token version** (invalidates all sessions) and denylists current **
 #### `POST /api/auth/logout` (Bearer JWT)
 
 Denylists current **JWT ID** in Redis. `200` → `{ "message": "Logged out" }`
+
+### Videos
+
+#### `POST /api/videos/upload` (Bearer JWT)
+
+- Body: `multipart/form-data` field **`file`**
+- Allowlist: MP4, AVI, MOV, WMV, FLV; max **500MB**
+- Rate limit: **5 / minute / user**
+- `201`:
+
+```json
+{
+  "taskId": "uuid",
+  "status": "queued",
+  "s3Key": "originals/userId/taskId/clip.mp4",
+  "etaSeconds": 90,
+  "progress": 0,
+  "metadata": { "durationSec": 125.4 }
+}
+```
+
+Task is stored as `queued` only — **no** worker processing until M3/M4. Multiple uploads are allowed (rate-limited); one-at-a-time applies to **processing**, not upload.
 
 ---
 
@@ -315,8 +354,72 @@ Different endpoints (`login` vs `register`) → **different** handler name in st
 
 ---
 
+## Upload & storage (M2)
+
+### Upload architecture
+
+```mermaid
+flowchart LR
+  Client --> API[NestJS API]
+  API --> Probe[FFprobe]
+  API --> S3[AWS S3]
+  API --> Mongo[(MongoDB video_tasks)]
+```
+
+- Client uploads multipart to the API with a JWT.
+- API validates type/size, probes **duration** with FFprobe, computes `etaSeconds = ceil(durationSec/60)*30`.
+- Original bytes go to **S3**; MongoDB stores a minimal `video_tasks` row (`s3Key` at root, `metadata.durationSec` only).
+- Queue/worker processing is **M3/M4** (concurrency 1). M2 only creates `queued` tasks.
+
+### Why AWS S3
+
+- Durable object storage without growing disks on API/worker containers.
+- Better fit for large video blobs (up to 500MB) than MongoDB or local container FS.
+- Same SDK path for originals now and processed outputs/thumbnails later (M4).
+- Keeps Compose lean (`api` + `redis`); S3 stays cloud-hosted like MongoDB.
+
+### Pros and cons
+
+| Pros | Cons |
+|------|------|
+| Scalable blob storage; no disk growth on API containers | Needs AWS credentials, bucket IAM, and network to AWS |
+| Clear split: DB = task state, S3 = bytes | Upload + later FFmpeg download add latency/cost |
+| Easy key prefixes per user/task | Local/dev needs real (or compatible) S3 access |
+| Ready for CDN in front of delivery later | Bad bucket policies can leak or block objects |
+
+### CDN notes
+
+Not implemented in M2 — planned delivery layer after processing:
+
+- S3 remains the **origin**; a CDN (e.g. CloudFront) can cache processed MP4s/thumbnails at edge POPs.
+- Repeat viewers hit the CDN instead of S3 (lower latency, lower egress).
+- Prefer **signed URLs** or private bucket + CDN origin access — avoid public-read buckets by default.
+- **Uploads stay API → S3**; CDN is for **read/delivery**, not ingest.
+
+### `video_tasks` schema
+
+Minimal document:
+
+| Field | Purpose |
+|--------|---------|
+| `taskId` | Public UUID |
+| `userId` | Owner |
+| `status` | `queued` (more states in later modules) |
+| `s3Key` | S3 object key (root field) |
+| `metadata` | `{ durationSec }` only |
+| `progress` | `0` until processing modules |
+| `etaSeconds` | Estimate at submit |
+| `createdAt` / `updatedAt` | Timestamps |
+
+---
 
 ## Module changelog
+
+### M2 — Upload & AWS S3
+
+- `POST /api/videos/upload` (JWT, multipart `file`, 500MB, format allowlist)
+- FFprobe duration → ETA; S3 `PutObject`; minimal `video_tasks` in MongoDB
+- API Docker image installs `ffmpeg` (FFprobe); README architecture / S3 / CDN notes
 
 ### M1 — Auth & security
 
@@ -341,8 +444,10 @@ videoProcessAssignment/
 │   ├── health/
 │   ├── redis/
 │   ├── users/
-│   └── auth/
-├── Dockerfile
+│   ├── auth/
+│   ├── s3/                     # AWS S3 client
+│   └── videos/                 # upload + video_tasks + ffprobe
+├── Dockerfile                  # includes ffmpeg/ffprobe
 ├── docker-compose.yml          # api + redis
 ├── .env.example
 ├── package.json

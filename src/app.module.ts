@@ -7,6 +7,7 @@ import { HealthModule } from './health/health.module.js';
 import { RedisModule } from './redis/redis.module.js';
 import { RedisThrottlerStorage } from './redis/redis-throttler.storage.js';
 import { UsersModule } from './users/users.module.js';
+import { VideosModule } from './videos/videos.module.js';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { UsersModule } from './users/users.module.js';
     }),
     UsersModule,
     AuthModule,
+    VideosModule,
     HealthModule,
   ],
 })
