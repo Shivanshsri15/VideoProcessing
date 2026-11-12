@@ -17,6 +17,7 @@ export class VideoTask {
   userId!: Types.ObjectId;
 
   @Prop({
+    type: String,
     required: true,
     enum: VIDEO_TASK_STATUSES,
     default: 'queued',
@@ -40,6 +41,9 @@ export class VideoTask {
 
   @Prop({ required: true })
   etaSeconds!: number;
+
+  @Prop({ required: false })
+  failureReason?: string;
 
   createdAt!: Date;
   updatedAt!: Date;

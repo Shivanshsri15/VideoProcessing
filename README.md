@@ -24,6 +24,9 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
   - [Pros and cons](#pros-and-cons)
   - [CDN notes](#cdn-notes)
   - [`video_tasks` schema](#video_tasks-schema)
+- [Queue & status (M3)](#queue--status-m3)
+  - [Global concurrency](#global-concurrency)
+  - [API vs worker connections](#api-vs-worker-connections)
 - [Module changelog](#module-changelog)
 - [Project layout](#project-layout)
 
@@ -34,7 +37,7 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 | **M0** | Scaffold (health, config, Docker API) | Done |
 | **M1** | Auth & security | Done |
 | **M2** | Upload & AWS S3 | Done |
-| M3 | Queue & status (+ worker in Compose) | Pending |
+| **M3** | Queue & status (+ worker in Compose) | Done |
 | M4 | FFmpeg worker | Pending |
 | M5 | Email notifications | Pending |
 | M6 | Analytics | Pending |
@@ -49,29 +52,33 @@ NestJS backend for authenticated video upload, async FFmpeg processing (BullMQ),
 | Auth | JWT + Passport, bcrypt, Redis JWT ID denylist, token version |
 | Database | **Cloud MongoDB** via `MONGODB_URI` (Mongoose) |
 | Cache / rate limit / denylist | Redis in Docker Compose |
-| Queue | BullMQ + Redis (M3+) |
+| Queue | BullMQ + Redis (shared queue; worker concurrency **1**) |
 | Storage | **AWS S3** (upload originals in M2) |
 | Media | **FFprobe** at upload (ETA); FFmpeg worker in M4 |
 | Email | Nodemailer → SMTP (M5) |
-| Containers | Compose: **`api` + `redis`** (M1); worker in M3 |
+| Containers | Compose: **`api` + `redis` + `worker`** |
 
 ## Architecture
 
-**M2 (current):** authenticated upload → FFprobe (ETA) → S3 object + minimal `video_tasks` row. Auth/rate-limit still use MongoDB + Redis. Processing queue/worker is **not** started yet (M3/M4).
+**M3 (current):** upload → FFprobe → S3 → Mongo `video_tasks` → Redis status cache → BullMQ enqueue. Separate **worker** process runs with **global concurrency 1**; FFmpeg body is still a stub until M4.
 
 ```text
 Client ──► NestJS API (Compose: api)
               ├── MongoDB (users + video_tasks)
-              ├── Redis (denylist + rate limits)
+              ├── Redis (denylist + rate limits + task:status cache)
               ├── FFprobe (duration → etaSeconds)
-              └── AWS S3 (original video bytes)
+              ├── AWS S3 (original video bytes)
+              └── BullMQ producer (enqueue process-video, jobId=taskId)
+
+         NestJS Worker (Compose: worker, concurrency 1)
+              └── BullMQ consumer (M3 stub holds jobs; M4 = FFmpeg)
 ```
 
 ## Prerequisites
 
 - **Node.js 24.22.x** — pinned in [`.nvmrc`](.nvmrc) / [`.node-version`](.node-version)
 - **npm 11.19.1** — `packageManager` in `package.json` (`corepack enable`)
-- Docker + Docker Compose (API + Redis)
+- Docker + Docker Compose (API + Redis + worker)
 - **cloud MongoDB** URI
 - **AWS S3** bucket + credentials
 - **FFprobe** on PATH for local `npm run start:dev` (Compose API image installs `ffmpeg`)
@@ -88,16 +95,18 @@ cp .env.example .env
 
 2. Allow your machine in the MongoDB network access list; ensure the IAM user can `s3:PutObject` on the bucket.
 
-### Local API + Compose Redis
+### Local API + Compose Redis (+ local worker)
 
 ```bash
 corepack enable
 npm install
 docker compose up redis -d
 npm run start:dev
+# other terminal:
+npm run start:worker:dev
 ```
 
-### Full Compose (API + Redis)
+### Full Compose (API + Redis + worker)
 
 ```bash
 docker compose up --build
@@ -135,6 +144,9 @@ See [`.env.example`](.env.example).
 | `S3_ORIGINAL_PREFIX` | `originals/` | Key prefix |
 | `MAX_UPLOAD_BYTES` | `524288000` | 500MB cap |
 | `FFPROBE_PATH` | `ffprobe` | FFprobe binary |
+| `VIDEO_QUEUE_NAME` | `video-processing` | Shared BullMQ queue (all users) |
+| `VIDEO_WORKER_CONCURRENCY` | `1` | **System-wide** processing concurrency |
+| `TASK_STATUS_CACHE_TTL_SEC` | `86400` | Redis `task:status:*` TTL |
 
 Never commit real credentials. `.env` is gitignored.
 
@@ -189,7 +201,29 @@ Denylists current **JWT ID** in Redis. `200` → `{ "message": "Logged out" }`
 }
 ```
 
-Task is stored as `queued` only — **no** worker processing until M3/M4. Multiple uploads are allowed (rate-limited); one-at-a-time applies to **processing**, not upload.
+Upload also **enqueues** a BullMQ job (`jobId = taskId`) and writes a Redis status snapshot. Multiple uploads are allowed (rate-limited); **processing** is system-wide concurrency **1** (not per-user). M3 worker stub holds jobs pending; real FFmpeg is M4.
+
+#### `GET /api/videos/tasks` (Bearer JWT)
+
+Query: `limit` (default 20, max 50), `skip` (default 0).  
+Returns the current user’s tasks (newest first) as status snapshots.
+
+#### `GET /api/videos/tasks/:taskId` (Bearer JWT)
+
+Owner-only task status (Redis cache with Mongo fallback). `404` if missing or not owned.
+
+#### `GET /api/videos/tasks/:taskId/progress` (Bearer JWT)
+
+```json
+{
+  "taskId": "uuid",
+  "status": "queued",
+  "progress": 0,
+  "etaSeconds": 30
+}
+```
+
+Progress stays `0` until M4 updates it during FFmpeg.
 
 ---
 
@@ -369,7 +403,7 @@ flowchart LR
 - Client uploads multipart to the API with a JWT.
 - API validates type/size, probes **duration** with FFprobe, computes `etaSeconds = ceil(durationSec/60)*30`.
 - Original bytes go to **S3**; MongoDB stores a minimal `video_tasks` row (`s3Key` at root, `metadata.durationSec` only).
-- Queue/worker processing is **M3/M4** (concurrency 1). M2 only creates `queued` tasks.
+- M3 enqueues BullMQ and caches status; M4 replaces the worker stub with FFmpeg (still concurrency 1).
 
 ### Why AWS S3
 
@@ -404,16 +438,49 @@ Minimal document:
 |--------|---------|
 | `taskId` | Public UUID |
 | `userId` | Owner |
-| `status` | `queued` (more states in later modules) |
+| `status` | `queued` \| `processing` \| `completed` \| `failed` \| `cancelled` |
 | `s3Key` | S3 object key (root field) |
 | `metadata` | `{ durationSec }` only |
-| `progress` | `0` until processing modules |
+| `progress` | `0` until M4 |
 | `etaSeconds` | Estimate at submit |
+| `failureReason` | Set if enqueue fails (M3) |
 | `createdAt` / `updatedAt` | Timestamps |
 
 ---
 
+## Queue & status (M3)
+
+### Global concurrency
+
+Processing is **one video at a time for the whole system** (not per-user):
+
+1. Single shared queue `video-processing`
+2. Exactly **one** Compose `worker` service (do not scale replicas)
+3. BullMQ `{ concurrency: 1 }` (`VIDEO_WORKER_CONCURRENCY`)
+
+Upload/auth rate limits remain per-IP / per-user; they do not control processing concurrency.
+
+### API vs worker connections
+
+- **API** (`node dist/main.js`) — HTTP + BullMQ **producer**
+- **Worker** (`node dist/worker.main.js`) — BullMQ **consumer** only
+- Both use the same `REDIS_URL`, each with its **own** connections
+- BullMQ uses a dedicated connection (`maxRetriesPerRequest: null`); `RedisService` (rate limits / JWT denylist / status cache) stays separate
+
+M3 worker stub logs the job and `moveToDelayed` (~24h) so jobs stay pending without FFmpeg. M4 replaces that stub.
+
+Redis status cache key: `task:status:{taskId}` (TTL from `TASK_STATUS_CACHE_TTL_SEC`).
+
+---
+
 ## Module changelog
+
+### M3 — Queue & status
+
+- BullMQ enqueue after upload (`jobId = taskId`); Redis `task:status:*` cache
+- `GET /api/videos/tasks`, `GET /api/videos/tasks/:taskId`, `GET .../progress`
+- Compose **`worker`** + `start:worker` / `start:worker:dev`; global concurrency **1**
+- Processor stub holds jobs for M4 FFmpeg (no transcode yet)
 
 ### M2 — Upload & AWS S3
 
@@ -440,15 +507,19 @@ Minimal document:
 videoProcessAssignment/
 ├── src/
 │   ├── main.ts
+│   ├── worker.main.ts          # worker process entry
 │   ├── app.module.ts
 │   ├── health/
 │   ├── redis/
+│   ├── queue/                  # shared BullMQ connection + job types
+│   ├── worker/                 # consumer module + processing processor
 │   ├── users/
 │   ├── auth/
 │   ├── s3/                     # AWS S3 client
-│   └── videos/                 # upload + video_tasks + ffprobe
+│   └── videos/                 # upload, status APIs, enqueue, cache, ffprobe
+│       └── queue/              # VideoQueueService (producer)
 ├── Dockerfile                  # includes ffmpeg/ffprobe
-├── docker-compose.yml          # api + redis
+├── docker-compose.yml          # api + redis + worker
 ├── .env.example
 ├── package.json
 └── README.md

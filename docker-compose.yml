@@ -1,4 +1,5 @@
-# M1: API + Redis. MongoDB is cloud-hosted via MONGODB_URI in .env.
+# M3: API + Redis + worker. MongoDB is cloud-hosted via MONGODB_URI in .env.
+# Keep a single worker replica — system-wide processing concurrency is 1.
 services:
   api:
     build:
@@ -11,6 +12,19 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3000
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/worker.main.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
       REDIS_URL: redis://redis:6379
     depends_on:
       - redis

@@ -33,6 +33,8 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return result === 1;
   };
 
+  get = async (key: string): Promise<string | null> => this.client.get(key);
+
   setWithTtlSeconds = async (
     key: string,
     value: string,

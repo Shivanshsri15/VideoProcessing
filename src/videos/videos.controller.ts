@@ -1,8 +1,11 @@
 import {
   Controller,
+  Get,
   HttpCode,
   HttpStatus,
+  Param,
   Post,
+  Query,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -20,6 +23,7 @@ import {
   VIDEO_UPLOAD_RATE_LIMIT,
   VIDEO_UPLOAD_RATE_TTL_MS,
 } from './constants/upload.constants.js';
+import { ListTasksQueryDto } from './dto/list-tasks-query.dto.js';
 import { createVideoUploadParseFilePipe } from './pipes/video-upload-file.pipe.js';
 import { VideosService } from './videos.service.js';
 
@@ -29,7 +33,7 @@ export class VideosController {
 
   /**
    * Use case: accept an authenticated video upload, probe duration for ETA,
-   * store the original in S3, and create a queued video task (no processing yet).
+   * store the original in S3, create a queued video task, and enqueue BullMQ.
    */
   @Post('upload')
   @UseGuards(JwtAuthGuard, UserThrottlerGuard)
@@ -51,5 +55,35 @@ export class VideosController {
     file: Express.Multer.File,
   ) {
     return this.videosService.handleUpload(user, file);
+  }
+
+  /** List the authenticated user's video tasks (newest first). */
+  @Get('tasks')
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  listTasks(
+    @GetUser() user: AuthenticatedUser,
+    @Query() query: ListTasksQueryDto,
+  ) {
+    return this.videosService.listTasks(user, query.limit, query.skip);
+  }
+
+  /** Get one task status (owner-only; Redis cache with Mongo fallback). */
+  @Get('tasks/:taskId')
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  getTask(
+    @GetUser() user: AuthenticatedUser,
+    @Param('taskId') taskId: string,
+  ) {
+    return this.videosService.getTask(user, taskId);
+  }
+
+  /** Progress snapshot for a task (progress stays 0 until M4). */
+  @Get('tasks/:taskId/progress')
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  getTaskProgress(
+    @GetUser() user: AuthenticatedUser,
+    @Param('taskId') taskId: string,
+  ) {
+    return this.videosService.getTaskProgress(user, taskId);
   }
 }
