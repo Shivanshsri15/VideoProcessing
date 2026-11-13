@@ -7,6 +7,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [What it does](#what-it-does)
 - [Tech stack](#tech-stack)
 - [Architecture](#architecture)
+- [Tentative cloud deployment](#tentative-cloud-deployment)
 - [End-to-end flow](#end-to-end-flow)
 - [Prerequisites](#prerequisites)
 - [Setup and run](#setup-and-run)
@@ -70,6 +71,47 @@ flowchart TB
 - **API process** (`node dist/main.js`) — HTTP, upload, enqueue, status reads.
 - **Worker process** (`node dist/worker.main.js`) — BullMQ consumer; FFmpeg + S3 + status writes + outcome email.
 - Same `REDIS_URL` and Mongo URI; separate process connections. BullMQ uses its own Redis client (`maxRetriesPerRequest: null`), separate from app `RedisService`.
+
+## Tentative cloud deployment
+
+Local Compose maps cleanly onto a managed AWS-style layout (illustrative — not provisioned in this repo). Mongo is already assumed cloud-hosted; S3 is already AWS.
+
+```mermaid
+flowchart TB
+  Users[Clients] --> ALB[Application_Load_Balancer]
+  ALB --> ApiSvc[ECS_Fargate_API]
+  ApiSvc --> Atlas[(MongoDB_Atlas)]
+  ApiSvc --> Redis[(ElastiCache_Redis)]
+  ApiSvc --> S3[S3_bucket]
+  ApiSvc --> Bull[BullMQ_on_Redis]
+  WorkerSvc[ECS_Fargate_Worker] --> Bull
+  WorkerSvc --> S3
+  WorkerSvc --> Atlas
+  WorkerSvc --> Redis
+  WorkerSvc --> SES[Amazon_SES_SMTP]
+  ApiSvc --> Secrets[Secrets_Manager_or_SSM]
+  WorkerSvc --> Secrets
+```
+
+| Compose today | Tentative cloud equivalent |
+|---------------|----------------------------|
+| `api` container | ECS/Fargate (or EKS) **API** service behind an ALB; scale replicas horizontally for HTTP |
+| `worker` container | Separate ECS/Fargate **worker** task with FFmpeg image; keep **1** active consumer (or concurrency 1) so processing stays system-wide single-file |
+| `redis` | ElastiCache Redis (or MemoryDB) — rate limits, JWT denylist, status cache, BullMQ |
+| `mailhog` | Amazon SES (SMTP) or another SMTP provider via existing `SMTP_*` env |
+| `MONGODB_URI` | MongoDB Atlas (or DocumentDB if preferred) |
+| `S3_BUCKET` + IAM keys | Same bucket; prefer task IAM role over long-lived access keys |
+| `.env` secrets | AWS Secrets Manager / SSM Parameter Store injected at deploy |
+
+**Suggested networking / ops notes**
+
+- Private subnets for API, worker, and Redis; ALB (and optional CloudFront later for thumbnails) in public subnets.
+- Security groups: ALB → API `:3000`; API/worker → Redis `:6379`, Atlas, S3, SES.
+- Worker needs more CPU/memory and ephemeral disk than API (temp stream files + FFmpeg).
+- CI builds the same multi-stage `Dockerfile`, pushes to ECR, deploys API + worker task definitions with shared env (except `SMTP_HOST` / secrets).
+- Health: ALB target group on `GET /health`; worker relies on ECS health + BullMQ metrics / `GET /api/videos/queue`.
+
+This is a **target architecture sketch** for production; the runnable path in this project remains `docker compose up --build`.
 
 ## End-to-end flow
 
