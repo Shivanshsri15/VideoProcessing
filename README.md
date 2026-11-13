@@ -88,9 +88,9 @@ sequenceDiagram
   A-->>C: taskId status queued etaSeconds
   Q->>W: claim next job concurrency 1
   W->>M: status processing
-  W->>S3: GetObject original
+  W->>S3: stream download original to temp
   W->>W: FFmpeg MP4 plus thumbnail
-  W->>S3: PutObject output and thumb
+  W->>S3: stream upload output and thumb
   W->>M: status completed progress 100
   W->>R: refresh status cache
   C->>A: GET progress or thumbnail
@@ -102,7 +102,7 @@ sequenceDiagram
 - Node.js 24.22.x and npm 11.19.1 (`corepack enable`)
 - Docker + Docker Compose
 - Cloud MongoDB URI (allow your IP)
-- AWS S3 bucket + IAM rights for `PutObject` / `GetObject`
+- AWS S3 bucket + IAM rights for `PutObject` / `GetObject` / `HeadObject` / `DeleteObject`
 - For local (non-Compose) API/worker: `ffprobe` and `ffmpeg` on `PATH`
 
 ## Setup and run
@@ -299,16 +299,20 @@ sequenceDiagram
 
   W->>M: processing progress 0
   W->>R: refresh cache
-  W->>S3: download original
+  W->>S3: stream download original to temp disk
+  Note over W,S3: Range resume if partial input exists
   W->>FF: transcode to MP4
   Note over W,M: Mongo progress every 5 percent
   W->>FF: one frame JPEG
-  W->>S3: upload output.mp4 and thumb.jpg
+  W->>S3: stream upload output.mp4 and thumb.jpg
   W->>M: completed progress 100
   W->>R: refresh cache
 ```
 
-On failure: `status: failed`, `failureReason` set; BullMQ job does not retry endlessly (`attempts: 1`).
+- Downloads/uploads stream to/from temp disk (no full-file Node buffers for media).
+- Original download is **resumable**: a partial temp `input` is kept across attempts; the next try uses S3 `Range` and appends.
+- On transient failure (S3 / FFmpeg), BullMQ retries up to **3** attempts with exponential backoff (~5s → 10s → 20s). Status stays `processing` until the last attempt.
+- On **final** failure: `status: failed`, `failureReason` set; orphaned processed objects (`output.mp4`, `thumb.jpg`) are deleted; temp work dir is wiped. The original upload remains. There is no manual retry API — upload again for a new task.
 
 ## Queue and worker
 
@@ -322,7 +326,9 @@ stateDiagram-v2
   [*] --> waiting: Queue_add
   waiting --> active: Worker_claim
   active --> completed: FFmpeg_ok
-  active --> failed: FFmpeg_or_IO_error
+  active --> delayed: transient_error_backoff
+  delayed --> waiting: retry_up_to_3
+  active --> failed: final_attempt_or_unrecoverable
 ```
 
 ### Redis: status cache vs BullMQ

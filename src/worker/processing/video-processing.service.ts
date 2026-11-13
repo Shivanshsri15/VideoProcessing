@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
-import { UnrecoverableError } from 'bullmq';
+import { Job, UnrecoverableError } from 'bullmq';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +9,9 @@ import { join } from 'node:path';
 import { Model } from 'mongoose';
 import type { ProcessVideoJobPayload } from '../../queue/types/process-video-job.js';
 import {
+  S3_OUTPUT_CONTENT_TYPE,
   S3_OUTPUT_FILENAME,
+  S3_THUMBNAIL_CONTENT_TYPE,
   S3_THUMBNAIL_FILENAME,
 } from '../../s3/s3.constants.js';
 import { S3Service } from '../../s3/s3.service.js';
@@ -44,7 +46,14 @@ export class VideoProcessingService {
     this.ffmpegPath = config.get<string>('FFMPEG_PATH', FFMPEG_DEFAULT_PATH);
   }
 
-  processJob = async (payload: ProcessVideoJobPayload): Promise<void> => {
+  processJob = async (
+    job: Job<ProcessVideoJobPayload>,
+  ): Promise<void> => {
+    const payload = job.data;
+    const maxAttempts = job.opts.attempts ?? 1;
+    // BullMQ: attemptsMade is prior failures (0 on first try). Final when attemptsMade+1 >= max.
+    const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+
     const task = await this.videoTaskModel
       .findOne({ taskId: payload.taskId })
       .exec();
@@ -61,13 +70,22 @@ export class VideoProcessingService {
     const inputPath = join(workDir, 'input');
     const outputPath = join(workDir, S3_OUTPUT_FILENAME);
     const thumbPath = join(workDir, S3_THUMBNAIL_FILENAME);
+    const outputKey = this.s3.buildTaskOutputKey(
+      payload.userId,
+      payload.taskId,
+    );
+    const thumbnailKey = this.s3.buildTaskThumbnailKey(
+      payload.userId,
+      payload.taskId,
+    );
+
+    let wipeWorkDir = false;
 
     try {
       await fs.mkdir(workDir, { recursive: true });
       await this.markProcessing(task);
 
-      const original = await this.s3.getObjectBuffer(payload.s3Key);
-      await fs.writeFile(inputPath, original);
+      await this.s3.downloadObjectToFile(payload.s3Key, inputPath);
 
       const durationSec = task.metadata.durationSec;
       await this.transcodeToMp4(inputPath, outputPath, durationSec, (p) =>
@@ -75,31 +93,53 @@ export class VideoProcessingService {
       );
       await this.extractThumbnail(inputPath, thumbPath);
 
-      const outputKey = this.s3.buildTaskOutputKey(
-        payload.userId,
-        payload.taskId,
-      );
-      const thumbnailKey = this.s3.buildTaskThumbnailKey(
-        payload.userId,
-        payload.taskId,
-      );
-
-      await this.s3.putProcessedOutput(
+      await this.s3.uploadFile(
         outputKey,
-        await fs.readFile(outputPath),
+        outputPath,
+        S3_OUTPUT_CONTENT_TYPE,
       );
-      await this.s3.putThumbnail(thumbnailKey, await fs.readFile(thumbPath));
+      await this.s3.uploadFile(
+        thumbnailKey,
+        thumbPath,
+        S3_THUMBNAIL_CONTENT_TYPE,
+      );
 
       await this.markCompleted(task, outputKey, thumbnailKey);
+      wipeWorkDir = true;
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : 'Processing failed';
-      this.logger.error(`Processing failed taskId=${payload.taskId}`, error);
-      await this.markFailed(task, reason);
-      throw new UnrecoverableError(reason);
+      this.logger.error(
+        `Processing failed taskId=${payload.taskId} attempt=${job.attemptsMade + 1}/${maxAttempts}`,
+        error,
+      );
+
+      if (isFinalAttempt) {
+        await this.markFailed(task, reason);
+        await this.s3.deleteProcessedArtifacts(outputKey, thumbnailKey);
+        wipeWorkDir = true;
+        throw error instanceof Error ? error : new Error(reason);
+      }
+
+      await this.removeTempOutputs(outputPath, thumbPath);
+      throw error instanceof Error ? error : new Error(reason);
     } finally {
-      await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      if (wipeWorkDir) {
+        await fs
+          .rm(workDir, { recursive: true, force: true })
+          .catch(() => undefined);
+      }
     }
+  };
+
+  private removeTempOutputs = async (
+    outputPath: string,
+    thumbPath: string,
+  ): Promise<void> => {
+    await Promise.all([
+      fs.unlink(outputPath).catch(() => undefined),
+      fs.unlink(thumbPath).catch(() => undefined),
+    ]);
   };
 
   private markProcessing = async (task: VideoTaskDocument): Promise<void> => {

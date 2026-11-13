@@ -18,8 +18,8 @@ export class VideoProcessingProcessor extends WorkerHost {
   // Nest/BullMQ require a prototype process hook on WorkerHost.
   async process(job: Job<ProcessVideoJobPayload>): Promise<void> {
     this.logger.log(
-      `Processing taskId=${job.data.taskId} (concurrency=${VIDEO_WORKER_CONCURRENCY})`,
+      `Processing taskId=${job.data.taskId} attempt=${job.attemptsMade + 1}/${job.opts.attempts ?? 1} (concurrency=${VIDEO_WORKER_CONCURRENCY})`,
     );
-    await this.processing.processJob(job.data);
+    await this.processing.processJob(job);
   }
 }

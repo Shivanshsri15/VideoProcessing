@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { PROCESS_VIDEO_JOB_NAME } from '../../queue/constants/queue.constants.js';
+import {
+  PROCESS_JOB_ATTEMPTS,
+  PROCESS_JOB_BACKOFF_MS,
+  PROCESS_VIDEO_JOB_NAME,
+} from '../../queue/constants/queue.constants.js';
 import { VideoQueueService } from './video-queue.service.js';
 
 describe('VideoQueueService', () => {
@@ -12,7 +16,7 @@ describe('VideoQueueService', () => {
     service = new VideoQueueService({ add } as never);
   });
 
-  it('enqueues with jobId equal to taskId', async () => {
+  it('enqueues with jobId equal to taskId and retry backoff', async () => {
     const payload = {
       taskId: 'task-1',
       userId: 'user-1',
@@ -23,7 +27,8 @@ describe('VideoQueueService', () => {
 
     expect(add).toHaveBeenCalledWith(PROCESS_VIDEO_JOB_NAME, payload, {
       jobId: 'task-1',
-      attempts: 1,
+      attempts: PROCESS_JOB_ATTEMPTS,
+      backoff: { type: 'exponential', delay: PROCESS_JOB_BACKOFF_MS },
       removeOnComplete: false,
       removeOnFail: false,
     });
