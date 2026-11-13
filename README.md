@@ -15,6 +15,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [Authentication and security](#authentication-and-security)
 - [Upload, storage, and processing](#upload-storage-and-processing)
 - [Processing optimizations](#processing-optimizations)
+- [Email notifications](#email-notifications)
 - [Queue and worker](#queue-and-worker)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
@@ -27,10 +28,11 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 | Upload | Multipart video → S3 original, duration via FFprobe, ETA |
 | Queue | BullMQ job per task; worker concurrency **1** (system-wide) |
 | Process | Stream S3 ↔ temp disk → H.264/AAC MP4 + JPEG thumb → stream to S3; retries with resumable download |
+| Email | Notify task owner on `completed` / final `failed` (Nodemailer → Mailhog/SMTP) |
 | Status | List/get task, progress polling, thumbnail download |
 | Security | bcrypt, JWT ID denylist, token version, Redis rate limits |
 
-**Not built yet:** email notifications, analytics APIs.
+**Not built yet:** analytics APIs.
 
 ## Tech stack
 
@@ -43,7 +45,8 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 | Queue | BullMQ (`video-processing`, concurrency 1) |
 | Storage | AWS S3 |
 | Media | FFprobe (upload ETA), FFmpeg (worker) |
-| Deploy | Docker Compose: `api` + `redis` + `worker` |
+| Email | Nodemailer → Mailhog (Compose) or real SMTP |
+| Deploy | Docker Compose: `api` + `redis` + `worker` + `mailhog` |
 
 ## Architecture
 
@@ -60,10 +63,12 @@ flowchart TB
   Worker --> FF[FFmpeg]
   Worker --> Mongo
   Worker --> Redis
+  Worker --> Mail[Nodemailer]
+  Mail --> SMTP[Mailhog_or_SMTP]
 ```
 
 - **API process** (`node dist/main.js`) — HTTP, upload, enqueue, status reads.
-- **Worker process** (`node dist/worker.main.js`) — BullMQ consumer; FFmpeg + S3 + status writes.
+- **Worker process** (`node dist/worker.main.js`) — BullMQ consumer; FFmpeg + S3 + status writes + outcome email.
 - Same `REDIS_URL` and Mongo URI; separate process connections. BullMQ uses its own Redis client (`maxRetriesPerRequest: null`), separate from app `RedisService`.
 
 ## End-to-end flow
@@ -94,6 +99,7 @@ sequenceDiagram
   W->>S3: stream upload output and thumb
   W->>M: status completed progress 100
   W->>R: refresh status cache
+  W->>W: email owner via SMTP
   C->>A: GET progress or thumbnail
   A-->>C: progress or JPEG
 ```
@@ -119,7 +125,8 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Health: [http://localhost:3000/health](http://localhost:3000/health)
+Health: [http://localhost:3000/health](http://localhost:3000/health)  
+Mailhog UI: [http://localhost:8025](http://localhost:8025)
 
 **Local API + Redis + worker:**
 
@@ -158,6 +165,9 @@ See [`.env.example`](.env.example). Do not commit real secrets.
 | `VIDEO_QUEUE_NAME` | BullMQ queue name |
 | `VIDEO_WORKER_CONCURRENCY` | Must stay `1` for one-at-a-time processing |
 | `TASK_STATUS_CACHE_TTL_SEC` | Status cache TTL (default 24h) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` | SMTP server (Compose sets host to `mailhog`) |
+| `SMTP_USER` / `SMTP_PASS` | Optional auth (leave empty for Mailhog) |
+| `MAIL_FROM` | From header for outcome emails |
 
 ## API reference
 
@@ -361,6 +371,30 @@ flowchart TD
   Last -->|yes| Fail[markFailed_delete_S3_orphans_wipe_temp]
 ```
 
+## Email notifications
+
+After a durable terminal status (`completed`, or `failed` on the **final** BullMQ attempt), the worker emails the task owner (`users.email`).
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant M as Mongo
+  participant U as Users
+  participant E as EmailService
+  participant S as Mailhog_SMTP
+
+  W->>M: markCompleted_or_markFailed
+  W->>U: findById_userId
+  W->>E: sendTaskOutcome
+  E->>S: SMTP_send
+  W->>M: set_emailNotifiedAt
+```
+
+- **Local inbox:** Mailhog UI at [http://localhost:8025](http://localhost:8025) (SMTP `1025`). Compose sets `SMTP_HOST=mailhog` for `api`/`worker`.
+- **Idempotency:** skip if `emailNotifiedAt` is already set; set it only after a successful send.
+- **Isolation:** SMTP/mail errors are logged only — they do **not** change task status or fail a successful job.
+- **Auth:** `SMTP_USER` / `SMTP_PASS` stay empty for Mailhog; fill them for real SMTP providers.
+
 ## Queue and worker
 
 - **One queue** for all users: `video-processing`
@@ -412,6 +446,7 @@ Mongo remains the source of truth for tasks. Cache miss → read Mongo → refil
 | `etaSeconds` | Estimate at submit |
 | `failureReason` | Optional |
 | `startedAt` / `completedAt` | Processing timing |
+| `emailNotifiedAt` | Set after successful outcome email |
 
 ## Project layout
 
@@ -423,12 +458,13 @@ src/
   auth/                   # JWT auth, guards, rate-limit by user
   users/
   videos/                 # upload, status APIs, enqueue, FFprobe, status cache
+  email/                  # Nodemailer + templates
   queue/                  # shared BullMQ connection
-  worker/                 # consumer + VideoProcessingService (FFmpeg)
+  worker/                 # consumer + VideoProcessingService (FFmpeg + notify)
   s3/
   redis/
   health/
-docker-compose.yml        # api, redis, worker
+docker-compose.yml        # api, redis, worker, mailhog
 Dockerfile                # Node image + ffmpeg/ffprobe
 .env.example
 ```

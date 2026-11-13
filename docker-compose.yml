@@ -1,4 +1,4 @@
-# M3: API + Redis + worker. MongoDB is cloud-hosted via MONGODB_URI in .env.
+# API + Redis + worker + Mailhog. MongoDB is cloud-hosted via MONGODB_URI in .env.
 # Keep a single worker replica — system-wide processing concurrency is 1.
 services:
   api:
@@ -13,8 +13,10 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3000
       REDIS_URL: redis://redis:6379
+      SMTP_HOST: mailhog
     depends_on:
       - redis
+      - mailhog
 
   worker:
     build:
@@ -26,8 +28,10 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       REDIS_URL: redis://redis:6379
+      SMTP_HOST: mailhog
     depends_on:
       - redis
+      - mailhog
 
   redis:
     image: redis:7-alpine
@@ -36,6 +40,12 @@ services:
     volumes:
       - redis_data:/data
     command: ["redis-server", "--appendonly", "yes"]
+
+  mailhog:
+    image: mailhog/mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
 
 volumes:
   redis_data:

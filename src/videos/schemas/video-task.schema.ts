@@ -57,6 +57,9 @@ export class VideoTask {
   @Prop({ type: Date, required: false })
   completedAt?: Date;
 
+  @Prop({ type: Date, required: false })
+  emailNotifiedAt?: Date;
+
   createdAt!: Date;
   updatedAt!: Date;
 }

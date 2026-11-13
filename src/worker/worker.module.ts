@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
+import { EmailModule } from '../email/email.module.js';
 import { QueueModule } from '../queue/queue.module.js';
 import { RedisModule } from '../redis/redis.module.js';
 import { S3Module } from '../s3/s3.module.js';
+import { UsersModule } from '../users/users.module.js';
 import {
   VideoTask,
   VideoTaskSchema,
@@ -35,6 +37,8 @@ import { VideoProcessingService } from './processing/video-processing.service.js
     RedisModule,
     QueueModule,
     S3Module,
+    EmailModule,
+    UsersModule,
   ],
   providers: [
     StatusCacheService,

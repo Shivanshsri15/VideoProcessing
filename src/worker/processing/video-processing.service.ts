@@ -7,6 +7,7 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Model } from 'mongoose';
+import { EmailService } from '../../email/email.service.js';
 import type { ProcessVideoJobPayload } from '../../queue/types/process-video-job.js';
 import {
   S3_OUTPUT_CONTENT_TYPE,
@@ -15,6 +16,7 @@ import {
   S3_THUMBNAIL_FILENAME,
 } from '../../s3/s3.constants.js';
 import { S3Service } from '../../s3/s3.service.js';
+import { UsersService } from '../../users/users.service.js';
 import {
   VideoTask,
   VideoTaskDocument,
@@ -41,6 +43,8 @@ export class VideoProcessingService {
     private readonly videoTaskModel: Model<VideoTaskDocument>,
     private readonly s3: S3Service,
     private readonly statusCache: StatusCacheService,
+    private readonly usersService: UsersService,
+    private readonly emailService: EmailService,
     config: ConfigService,
   ) {
     this.ffmpegPath = config.get<string>('FFMPEG_PATH', FFMPEG_DEFAULT_PATH);
@@ -105,6 +109,7 @@ export class VideoProcessingService {
       );
 
       await this.markCompleted(task, outputKey, thumbnailKey);
+      await this.notifyTaskOwner(task);
       wipeWorkDir = true;
     } catch (error) {
       const reason =
@@ -117,6 +122,7 @@ export class VideoProcessingService {
       if (isFinalAttempt) {
         await this.markFailed(task, reason);
         await this.s3.deleteProcessedArtifacts(outputKey, thumbnailKey);
+        await this.notifyTaskOwner(task);
         wipeWorkDir = true;
         throw error instanceof Error ? error : new Error(reason);
       }
@@ -203,6 +209,43 @@ export class VideoProcessingService {
       this.logger.error(
         `Failed to persist failure for taskId=${task.taskId}`,
         persistError,
+      );
+    }
+  };
+
+  /** Best-effort owner email; never throws into the job path. */
+  private notifyTaskOwner = async (
+    task: VideoTaskDocument,
+  ): Promise<void> => {
+    if (task.emailNotifiedAt) {
+      return;
+    }
+    if (task.status !== 'completed' && task.status !== 'failed') {
+      return;
+    }
+
+    try {
+      const user = await this.usersService.findById(String(task.userId));
+      if (!user?.email) {
+        this.logger.warn(
+          `Skip notify: no user email for taskId=${task.taskId}`,
+        );
+        return;
+      }
+
+      await this.emailService.sendTaskOutcome({
+        to: user.email,
+        taskId: task.taskId,
+        status: task.status,
+        failureReason: task.failureReason,
+      });
+
+      task.emailNotifiedAt = new Date();
+      await task.save();
+    } catch (error) {
+      this.logger.error(
+        `Email notify failed taskId=${task.taskId} (job outcome unchanged)`,
+        error,
       );
     }
   };

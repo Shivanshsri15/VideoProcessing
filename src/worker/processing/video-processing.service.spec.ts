@@ -17,14 +17,18 @@ describe('VideoProcessingService.processJob', () => {
       `thumbnails/${userId}/${taskId}/thumb.jpg`,
   );
   const statusCacheSet = vi.fn().mockResolvedValue(undefined);
+  const findById = vi.fn();
+  const sendTaskOutcome = vi.fn();
 
   let service: VideoProcessingService;
   let task: {
     taskId: string;
+    userId: string;
     status: string;
     progress: number;
     metadata: { durationSec: number };
     failureReason?: string;
+    emailNotifiedAt?: Date;
     save: typeof save;
   };
 
@@ -32,6 +36,7 @@ describe('VideoProcessingService.processJob', () => {
     vi.clearAllMocks();
     task = {
       taskId: 'task-1',
+      userId: '507f1f77bcf86cd799439011',
       status: 'queued',
       progress: 0,
       metadata: { durationSec: 10 },
@@ -40,6 +45,8 @@ describe('VideoProcessingService.processJob', () => {
     findOne.mockReturnValue({ exec: vi.fn().mockResolvedValue(task) });
     downloadObjectToFile.mockRejectedValue(new Error('download blew up'));
     deleteProcessedArtifacts.mockResolvedValue(undefined);
+    findById.mockResolvedValue({ email: 'owner@example.com' });
+    sendTaskOutcome.mockResolvedValue(undefined);
 
     service = new VideoProcessingService(
       { findOne } as never,
@@ -51,6 +58,8 @@ describe('VideoProcessingService.processJob', () => {
         buildTaskThumbnailKey,
       } as never,
       { set: statusCacheSet } as never,
+      { findById } as never,
+      { sendTaskOutcome } as never,
       { get: () => 'ffmpeg' } as never,
     );
   });
@@ -66,19 +75,18 @@ describe('VideoProcessingService.processJob', () => {
       opts: { attempts },
     }) as never;
 
-  it('rethrows without markFailed or orphan delete on non-final attempt', async () => {
-    // attemptsMade 0 = first try; 1 = second try (still retryable with attempts=3)
+  it('rethrows without markFailed, orphan delete, or email on non-final attempt', async () => {
     await expect(service.processJob(job(0, 3))).rejects.toThrow(
       'download blew up',
     );
 
     expect(task.status).toBe('processing');
     expect(deleteProcessedArtifacts).not.toHaveBeenCalled();
+    expect(sendTaskOutcome).not.toHaveBeenCalled();
     expect(task.failureReason).toBeUndefined();
   });
 
-  it('markFailed and deletes orphans on final attempt', async () => {
-    // attemptsMade 2 with attempts 3 = third/final try
+  it('markFailed, deletes orphans, and notifies on final attempt', async () => {
     await expect(service.processJob(job(2, 3))).rejects.toThrow(
       'download blew up',
     );
@@ -89,6 +97,24 @@ describe('VideoProcessingService.processJob', () => {
       'originals/507f1f77bcf86cd799439011/task-1/output.mp4',
       'thumbnails/507f1f77bcf86cd799439011/task-1/thumb.jpg',
     );
+    expect(sendTaskOutcome).toHaveBeenCalledWith({
+      to: 'owner@example.com',
+      taskId: 'task-1',
+      status: 'failed',
+      failureReason: 'download blew up',
+    });
+    expect(task.emailNotifiedAt).toBeInstanceOf(Date);
+  });
+
+  it('keeps failed status when email send throws', async () => {
+    sendTaskOutcome.mockRejectedValue(new Error('smtp down'));
+
+    await expect(service.processJob(job(2, 3))).rejects.toThrow(
+      'download blew up',
+    );
+
+    expect(task.status).toBe('failed');
+    expect(task.emailNotifiedAt).toBeUndefined();
   });
 
   it('throws UnrecoverableError when task is missing', async () => {
@@ -98,6 +124,7 @@ describe('VideoProcessingService.processJob', () => {
       UnrecoverableError,
     );
     expect(deleteProcessedArtifacts).not.toHaveBeenCalled();
+    expect(sendTaskOutcome).not.toHaveBeenCalled();
   });
 
   it('skips work when task already completed', async () => {
@@ -106,5 +133,6 @@ describe('VideoProcessingService.processJob', () => {
     await service.processJob(job(1, 3));
 
     expect(downloadObjectToFile).not.toHaveBeenCalled();
+    expect(sendTaskOutcome).not.toHaveBeenCalled();
   });
 });
