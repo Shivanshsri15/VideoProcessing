@@ -51,12 +51,6 @@ export class S3Service {
     );
     this.client = new S3Client({
       region,
-      credentials: {
-        accessKeyId: this.config.getOrThrow<string>('AWS_ACCESS_KEY_ID'),
-        secretAccessKey: this.config.getOrThrow<string>(
-          'AWS_SECRET_ACCESS_KEY',
-        ),
-      },
     });
   }
 
