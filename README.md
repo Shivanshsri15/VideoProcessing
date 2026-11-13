@@ -106,47 +106,32 @@ sequenceDiagram
 
 ## Prerequisites
 
-- Node.js 24.22.x and npm 11.19.1 (`corepack enable`)
 - Docker + Docker Compose
 - Cloud MongoDB URI (allow your IP)
 - AWS S3 bucket + IAM rights for `PutObject` / `GetObject` / `HeadObject` / `DeleteObject`
-- For local (non-Compose) API/worker: `ffprobe` and `ffmpeg` on `PATH`
 
 ## Setup and run
+
+1. Copy env and fill secrets:
 
 ```bash
 cp .env.example .env
 # Fill MONGODB_URI, JWT_SECRET, AWS_* , S3_BUCKET
 ```
 
-**Compose (recommended):**
+2. Start the stack:
 
 ```bash
 docker compose up --build
 ```
 
+Services: `api`, `worker`, `redis`, `mailhog`.  
 Health: [http://localhost:3000/health](http://localhost:3000/health)  
 Mailhog UI: [http://localhost:8025](http://localhost:8025)
 
-**Local API + Redis + worker:**
-
-```bash
-docker compose up redis -d
-npm install
-npm run start:dev
-# other terminal
-npm run start:worker:dev
-```
-
-**Tests:**
-
-```bash
-npm run test
-```
-
 ### Docker `npm ci` / lockfile sync
 
-Compose builds use **Node 24.22** + **npm 11.19.1** (`npm ci`). If your machine uses a different Node/npm (or `npm install --force`), `package-lock.json` can drift and the image build fails with errors like `Missing: @emnapi/core@… from lock file`.
+Compose builds use **Node 24.22** + **npm 11.19.1** (`npm ci`). If `package-lock.json` was generated with a different Node/npm, the image build can fail with errors like `Missing: @emnapi/core@… from lock file`.
 
 **Fix — regenerate the lockfile with the same toolchain as Docker, then rebuild:**
 
@@ -157,7 +142,7 @@ docker run --rm -v "${PWD}:/app" -w /app node:24.22-bookworm-slim bash -lc "core
 docker compose up --build
 ```
 
-Commit the updated `package-lock.json`. For day-to-day local installs, match prerequisites (`corepack enable` → npm **11.19.1**, Node **24.22.x**) so the lockfile stays compatible with Compose.
+Commit the updated `package-lock.json` so Compose builds stay reproducible.
 
 ## Environment variables
 
