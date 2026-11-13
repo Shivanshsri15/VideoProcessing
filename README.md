@@ -14,6 +14,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [API reference](#api-reference)
 - [Authentication and security](#authentication-and-security)
 - [Upload, storage, and processing](#upload-storage-and-processing)
+- [Processing optimizations](#processing-optimizations)
 - [Queue and worker](#queue-and-worker)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
@@ -25,7 +26,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 | Auth | Register, login, logout, change password (JWT) |
 | Upload | Multipart video → S3 original, duration via FFprobe, ETA |
 | Queue | BullMQ job per task; worker concurrency **1** (system-wide) |
-| Process | Download → H.264/AAC MP4 + JPEG thumbnail → S3 |
+| Process | Stream S3 ↔ temp disk → H.264/AAC MP4 + JPEG thumb → stream to S3; retries with resumable download |
 | Status | List/get task, progress polling, thumbnail download |
 | Security | bcrypt, JWT ID denylist, token version, Redis rate limits |
 
@@ -293,26 +294,72 @@ S3 holds bytes; Mongo holds task state. A CDN can sit in front of processed obje
 sequenceDiagram
   participant W as Worker
   participant S3 as S3
+  participant Disk as TempDisk
   participant FF as FFmpeg
   participant M as Mongo
   participant R as Redis
 
   W->>M: processing progress 0
   W->>R: refresh cache
-  W->>S3: stream download original to temp disk
-  Note over W,S3: Range resume if partial input exists
-  W->>FF: transcode to MP4
-  Note over W,M: Mongo progress every 5 percent
-  W->>FF: one frame JPEG
-  W->>S3: stream upload output.mp4 and thumb.jpg
+  W->>S3: GetObject stream plus optional Range
+  S3-->>Disk: pipe chunks to input file
+  Note over W,Disk: wait until input is complete
+  W->>FF: -i input path file to file
+  FF-->>Disk: write output.mp4 while encoding
+  W->>FF: extract thumb.jpg
+  W->>S3: multipart stream upload output and thumb
   W->>M: completed progress 100
   W->>R: refresh cache
+  W->>Disk: rm work dir
 ```
 
-- Downloads/uploads stream to/from temp disk (no full-file Node buffers for media).
-- Original download is **resumable**: a partial temp `input` is kept across attempts; the next try uses S3 `Range` and appends.
-- On transient failure (S3 / FFmpeg), BullMQ retries up to **3** attempts with exponential backoff (~5s → 10s → 20s). Status stays `processing` until the last attempt.
-- On **final** failure: `status: failed`, `failureReason` set; orphaned processed objects (`output.mp4`, `thumb.jpg`) are deleted; temp work dir is wiped. The original upload remains. There is no manual retry API — upload again for a new task.
+Order is still **download complete → FFmpeg → upload**. Streaming means low-RAM I/O to/from disk, not overlapping encode while the download is still in progress.
+
+## Processing optimizations
+
+### Stream to disk (not into Node RAM)
+
+| Before | Now |
+|--------|-----|
+| `GetObject` → full `Buffer` in heap → `writeFile` | `GetObject` body **piped** to a temp file |
+| `readFile` entire MP4/JPEG into `Buffer` → `PutObject` | `@aws-sdk/lib-storage` **streams** file reads to S3 (multipart for large outputs) |
+
+FFmpeg still needs a **seekable** local file (`-i` path), so the worker materializes `tmpdir()/process-{taskId}/input` first, then runs file→file transcode/thumbnail, then streams results up.
+
+### Resumable original download
+
+If download fails mid-transfer, the partial `input` is **kept**. The next BullMQ attempt:
+
+1. `HeadObject` → expected size  
+2. If local size already matches → skip download  
+3. If `0 < size < expected` → `GetObject` with `Range: bytes=N-` and **append**  
+4. If oversized/corrupt local size → delete and start fresh  
+
+### Retries and failure cleanup
+
+| Failure | Behavior |
+|---------|----------|
+| S3 download | Retry; resume from partial `input` |
+| FFmpeg transcode / thumbnail | Retry; delete temp `output.mp4` / `thumb.jpg`; **keep** complete `input` (no mid-encode resume — FFmpeg restarts from 0) |
+| S3 upload | Retry; next attempt overwrites the same keys |
+| Final attempt failed | `status: failed` + `failureReason`; **delete** orphaned `output.mp4` / `thumb.jpg` on S3; wipe temp dir; **keep** original upload |
+| Task missing | Immediate `UnrecoverableError` (no retries) |
+
+- **Attempts:** 3 (`PROCESS_JOB_ATTEMPTS`)  
+- **Backoff:** exponential from 5s (`PROCESS_JOB_BACKOFF_MS`) → ~5s, 10s, 20s  
+- Between retries status stays `processing` (no user-facing `failed` until the last attempt)  
+- No manual retry API — upload again for a new task  
+
+```mermaid
+flowchart TD
+  Start[processJob_attempt] --> Run[resume_download_then_FFmpeg_then_upload]
+  Run -->|ok| Done[markCompleted_wipe_temp]
+  Run -->|error| Last{final_attempt?}
+  Last -->|no| Keep[keep_input_drop_temp_outputs]
+  Keep --> Wait[BullMQ_exponential_backoff]
+  Wait --> Start
+  Last -->|yes| Fail[markFailed_delete_S3_orphans_wipe_temp]
+```
 
 ## Queue and worker
 
@@ -320,12 +367,13 @@ sequenceDiagram
 - **One worker** container/process; **concurrency 1** → one video processed at a time globally (uploads can still arrive in parallel)
 - API **produces** jobs; worker **consumes** them from Redis (FIFO waiting list)
 - `jobId = taskId` avoids duplicate jobs for the same task
+- Jobs use **3 attempts** + exponential backoff; see [Processing optimizations](#processing-optimizations)
 
 ```mermaid
 stateDiagram-v2
   [*] --> waiting: Queue_add
   waiting --> active: Worker_claim
-  active --> completed: FFmpeg_ok
+  active --> completed: pipeline_ok
   active --> delayed: transient_error_backoff
   delayed --> waiting: retry_up_to_3
   active --> failed: final_attempt_or_unrecoverable
