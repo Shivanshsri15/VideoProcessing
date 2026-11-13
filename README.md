@@ -144,6 +144,21 @@ npm run start:worker:dev
 npm run test
 ```
 
+### Docker `npm ci` / lockfile sync
+
+Compose builds use **Node 24.22** + **npm 11.19.1** (`npm ci`). If your machine uses a different Node/npm (or `npm install --force`), `package-lock.json` can drift and the image build fails with errors like `Missing: @emnapi/core@… from lock file`.
+
+**Fix — regenerate the lockfile with the same toolchain as Docker, then rebuild:**
+
+```bash
+# From the repo root (PowerShell / bash)
+docker run --rm -v "${PWD}:/app" -w /app node:24.22-bookworm-slim bash -lc "corepack enable && corepack prepare npm@11.19.1 --activate && rm -rf node_modules && npm install && npm ci"
+
+docker compose up --build
+```
+
+Commit the updated `package-lock.json`. For day-to-day local installs, match prerequisites (`corepack enable` → npm **11.19.1**, Node **24.22.x**) so the lockfile stays compatible with Compose.
+
 ## Environment variables
 
 See [`.env.example`](.env.example). Do not commit real secrets.
