@@ -16,6 +16,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [Upload, storage, and processing](#upload-storage-and-processing)
 - [Processing optimizations](#processing-optimizations)
 - [Email notifications](#email-notifications)
+- [Analytics (DevOps)](#analytics-devops)
 - [Queue and worker](#queue-and-worker)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
@@ -29,10 +30,9 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 | Queue | BullMQ job per task; worker concurrency **1** (system-wide) |
 | Process | Stream S3 ↔ temp disk → H.264/AAC MP4 + JPEG thumb → stream to S3; retries with resumable download |
 | Email | Notify task owner on `completed` / final `failed` (Nodemailer → Mailhog/SMTP) |
+| Analytics | JWT DevOps JSON: processing stats, queue snapshot, API process resources |
 | Status | List/get task, progress polling, thumbnail download |
 | Security | bcrypt, JWT ID denylist, token version, Redis rate limits |
-
-**Not built yet:** analytics APIs.
 
 ## Tech stack
 
@@ -195,6 +195,9 @@ Base URL: `http://localhost:3000`
 | `GET` | `/api/videos/tasks/:taskId` | Bearer | Owner-only status snapshot |
 | `GET` | `/api/videos/tasks/:taskId/progress` | Bearer | `{ taskId, status, progress, etaSeconds }` |
 | `GET` | `/api/videos/tasks/:taskId/thumbnail` | Bearer | `image/jpeg` when completed |
+| `GET` | `/api/videos/analytics` | Bearer | System-wide processing stats + caller `userActivity` |
+| `GET` | `/api/videos/queue` | Bearer | BullMQ counts, concurrency, estimated wait |
+| `GET` | `/api/videos/system` | Bearer | API process memory/CPU/uptime + worker config |
 
 **Upload response example:**
 
@@ -395,6 +398,24 @@ sequenceDiagram
 - **Isolation:** SMTP/mail errors are logged only — they do **not** change task status or fail a successful job.
 - **Auth:** `SMTP_USER` / `SMTP_PASS` stay empty for Mailhog; fill them for real SMTP providers.
 
+## Analytics (DevOps)
+
+JWT-only JSON metrics for operators (no web UI). Bonus features (cancel, priority, multi-format, readiness probes beyond `GET /health`) are out of scope.
+
+```mermaid
+flowchart LR
+  Client --> API[AnalyticsController]
+  API --> Mongo[video_tasks]
+  API --> Bull[BullMQ_counts]
+  API --> Proc[API_process_metrics]
+```
+
+| Endpoint | Source |
+|----------|--------|
+| `GET /api/videos/analytics` | Mongo aggregates: status totals, failure rate, processing-time avg/p50/p95/distribution (from `startedAt`/`completedAt`), ETA vs actual, caller upload activity |
+| `GET /api/videos/queue` | BullMQ `getJobCounts`; `estimatedWaitSeconds ≈ waiting × avg recent completed duration`; concurrency from `VIDEO_WORKER_CONCURRENCY` |
+| `GET /api/videos/system` | **API** Node process: `process.memoryUsage()`, `process.uptime()`, `os.loadavg()`, `process.cpuUsage()`; worker concurrency/queue name from shared constants (not live FFmpeg RSS in the worker container) |
+
 ## Queue and worker
 
 - **One queue** for all users: `video-processing`
@@ -457,7 +478,7 @@ src/
   app.module.ts
   auth/                   # JWT auth, guards, rate-limit by user
   users/
-  videos/                 # upload, status APIs, enqueue, FFprobe, status cache
+  videos/                 # upload, status APIs, enqueue, FFprobe, status cache, analytics
   email/                  # Nodemailer + templates
   queue/                  # shared BullMQ connection
   worker/                 # consumer + VideoProcessingService (FFmpeg + notify)

@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { QueueModule } from '../queue/queue.module.js';
 import { S3Module } from '../s3/s3.module.js';
+import { AnalyticsController } from './analytics/analytics.controller.js';
+import { AnalyticsService } from './analytics/analytics.service.js';
 import { FfprobeService } from './media/ffprobe.service.js';
 import { VideoQueueService } from './queue/video-queue.service.js';
 import {
@@ -20,12 +22,13 @@ import { VideosService } from './videos.service.js';
       { name: VideoTask.name, schema: VideoTaskSchema },
     ]),
   ],
-  controllers: [VideosController],
+  controllers: [VideosController, AnalyticsController],
   providers: [
     VideosService,
     FfprobeService,
     StatusCacheService,
     VideoQueueService,
+    AnalyticsService,
   ],
   exports: [VideosService],
 })

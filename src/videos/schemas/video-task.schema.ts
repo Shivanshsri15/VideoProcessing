@@ -66,3 +66,4 @@ export class VideoTask {
 
 export const VideoTaskSchema = SchemaFactory.createForClass(VideoTask);
 VideoTaskSchema.index({ userId: 1, createdAt: -1 });
+VideoTaskSchema.index({ status: 1 });
