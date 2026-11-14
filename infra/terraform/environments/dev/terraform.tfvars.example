@@ -1,0 +1,4 @@
+aws_region               = "ap-south-1"
+project_name              = "video-processing"
+environment               = "dev"
+existing_s3_bucket_name   = "YOUR-EXISTING-APPLICATION-BUCKET"
