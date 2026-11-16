@@ -47,6 +47,15 @@ variable "health_check_matcher" {
   default     = "200-399"
 }
 
+variable "acm_certificate_arn" {
+  description = <<-EOT
+    Optional ACM certificate ARN for an HTTPS listener on port 443.
+    Leave null for HTTP-only (acceptable for early Dev; configure before production).
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "tags" {
   description = "Common tags applied to AWS resources."
   type        = map(string)

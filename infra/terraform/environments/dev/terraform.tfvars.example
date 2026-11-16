@@ -1,4 +1,32 @@
-aws_region               = "ap-south-1"
-project_name              = "video-processing"
-environment               = "dev"
-existing_s3_bucket_name   = "YOUR-EXISTING-APPLICATION-BUCKET"
+aws_region              = "ap-south-1"
+project_name            = "video-processing"
+environment             = "dev"
+existing_s3_bucket_name = "your-s3-bucket-name"
+
+# ECR image tag (API + worker share the same image — tag must exist in ECR before tasks start)
+# Repository tags are IMMUTABLE — use a unique tag per push
+image_tag = "dev-initial"
+
+# Worker overrides image CMD ["node","dist/main.js"] — same as docker-compose worker
+worker_command = ["node", "dist/worker.main.js"]
+
+# Optional: keep services stopped until the image is pushed
+# api_desired_count    = 0
+# worker_desired_count = 0
+
+# Optional HTTPS (omit / null = HTTP-only Dev ALB)
+# acm_certificate_arn = "arn:aws:acm:ap-south-1:ACCOUNT:certificate/..."
+
+# SMTP (SES or other — not Mailhog)
+# smtp_host   = "email-smtp.ap-south-1.amazonaws.com"
+# smtp_port   = "587"
+# smtp_secure = "true"
+# mail_from   = "Video Process <noreply@yourdomain.com>"
+
+# Secrets Manager ARNs only (never put secret values in tfvars).
+# ECS valueFrom appends :JSON_KEY:: in main.tf (e.g. arn:...:secret:NAME-xxxx:MONGODB_URI::).
+# mongodb_uri_secret_arn = "arn:aws:secretsmanager:ap-south-1:ACCOUNT:secret:..."
+# jwt_secret_arn         = "arn:aws:secretsmanager:ap-south-1:ACCOUNT:secret:..."
+# smtp_user_secret_arn   = "arn:aws:secretsmanager:ap-south-1:ACCOUNT:secret:..."
+# smtp_pass_secret_arn   = "arn:aws:secretsmanager:ap-south-1:ACCOUNT:secret:..."
+# secrets_kms_key_arns   = ["arn:aws:kms:ap-south-1:ACCOUNT:key/..."]

@@ -7,7 +7,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [What it does](#what-it-does)
 - [Tech stack](#tech-stack)
 - [Architecture](#architecture)
-- [Tentative cloud deployment](#tentative-cloud-deployment)
+- [Cloud deployment (AWS)](#cloud-deployment-aws)
 - [End-to-end flow](#end-to-end-flow)
 - [Prerequisites](#prerequisites)
 - [Setup and run](#setup-and-run)
@@ -47,7 +47,8 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 | Storage | AWS S3 |
 | Media | FFprobe (upload ETA), FFmpeg (worker) |
 | Email | Nodemailer → Mailhog (Compose) or real SMTP |
-| Deploy | Docker Compose: `api` + `redis` + `worker` + `mailhog` |
+| Deploy (local) | Docker Compose: `api` + `redis` + `worker` + `mailhog` |
+| Deploy (AWS) | Terraform → VPC, ALB, ECS Fargate, ECR, Secrets Manager, Cloud Map Redis |
 
 ## Architecture
 
@@ -72,46 +73,82 @@ flowchart TB
 - **Worker process** (`node dist/worker.main.js`) — BullMQ consumer; FFmpeg + S3 + status writes + outcome email.
 - Same `REDIS_URL` and Mongo URI; separate process connections. BullMQ uses its own Redis client (`maxRetriesPerRequest: null`), separate from app `RedisService`.
 
-## Tentative cloud deployment
+## Cloud deployment (AWS)
 
-Local Compose maps cleanly onto a managed AWS-style layout (illustrative — not provisioned in this repo). Mongo is already assumed cloud-hosted; S3 is already AWS.
+Infrastructure-as-code under [`infra/terraform`](infra/terraform) provisions a **Dev** stack in **`ap-south-1`**. Local Compose remains the day-to-day path; AWS is the production-shaped deployment of the same API + worker image.
+
+### Architecture
 
 ```mermaid
 flowchart TB
-  Users[Clients] --> ALB[Application_Load_Balancer]
-  ALB --> ApiSvc[ECS_Fargate_API]
-  ApiSvc --> Atlas[(MongoDB_Atlas)]
-  ApiSvc --> Redis[(ElastiCache_Redis)]
-  ApiSvc --> S3[S3_bucket]
-  ApiSvc --> Bull[BullMQ_on_Redis]
-  WorkerSvc[ECS_Fargate_Worker] --> Bull
-  WorkerSvc --> S3
-  WorkerSvc --> Atlas
-  WorkerSvc --> Redis
-  WorkerSvc --> SES[Amazon_SES_SMTP]
-  ApiSvc --> Secrets[Secrets_Manager_or_SSM]
-  WorkerSvc --> Secrets
+  Clients[Clients] --> ALB[ALB_HTTP_80]
+  ALB -->|health_/health| API[ECS_Fargate_API]
+  subgraph vpc [VPC]
+    subgraph public [Public_subnets]
+      ALB
+      NAT[Single_NAT_Gateway]
+    end
+    subgraph private [Private_app_subnets]
+      API
+      Worker[ECS_Fargate_Worker]
+      Redis[ECS_Fargate_Redis]
+      CM[Cloud_Map_DNS]
+    end
+    S3GW[S3_Gateway_VPC_Endpoint]
+  end
+  API --> Atlas[(MongoDB_Atlas)]
+  Worker --> Atlas
+  API --> Redis
+  Worker --> Redis
+  Redis --> CM
+  API --> S3[Existing_S3_bucket]
+  Worker --> S3
+  API --> SM[Secrets_Manager]
+  Worker --> SM
+  ECR[ECR_immutable_tags] --> API
+  ECR --> Worker
+  NAT --> Atlas
+  NAT --> SM
+  S3GW --> S3
 ```
 
-| Compose today | Tentative cloud equivalent |
-|---------------|----------------------------|
-| `api` container | ECS/Fargate (or EKS) **API** service behind an ALB; scale replicas horizontally for HTTP |
-| `worker` container | Separate ECS/Fargate **worker** task with FFmpeg image; keep **1** active consumer (or concurrency 1) so processing stays system-wide single-file |
-| `redis` | ElastiCache Redis (or MemoryDB) — rate limits, JWT denylist, status cache, BullMQ |
-| `mailhog` | Amazon SES (SMTP) or another SMTP provider via existing `SMTP_*` env |
-| `MONGODB_URI` | MongoDB Atlas (or DocumentDB if preferred) |
-| `S3_BUCKET` + IAM keys | Same bucket; prefer task IAM role over long-lived access keys |
-| `.env` secrets | AWS Secrets Manager / SSM Parameter Store injected at deploy |
+### What Terraform builds
 
-**Suggested networking / ops notes**
+| Area | Implementation |
+|------|----------------|
+| **Networking** | Multi-AZ VPC, public + private app subnets, **one NAT Gateway**, Internet Gateway, **S3 Gateway VPC endpoint** (private S3 without NAT hairpin) |
+| **Edge** | Application Load Balancer (HTTP `:80`); target group health check `GET /health` → `200–399` |
+| **Compute** | ECS Fargate cluster: **API** (0.5 vCPU / 1 GB) and **worker** (1 vCPU / 2 GB); same ECR image, worker command `node dist/worker.main.js` |
+| **Redis** | Redis 7 on Fargate + **AWS Cloud Map** private DNS (`redis.video-processing-dev.internal:6379`) — rate limits, JWT denylist, status cache, BullMQ |
+| **Images** | ECR repo `video-processing-dev`, **immutable** tags, scan-on-push, lifecycle retention |
+| **IAM** | Execution role (ECR pull, logs, scoped `secretsmanager:GetSecretValue`); separate API/worker **task roles** with least-privilege S3 on the existing bucket |
+| **Secrets** | Secrets Manager ARNs injected as ECS `secrets` (`ARN:json-key::`); values never in Terraform state inputs/outputs |
+| **Data plane** | Existing app S3 bucket + **MongoDB Atlas** (egress TCP `27017`); SMTP via env (e.g. SES) |
+| **Security groups** | ALB ← internet; API ← ALB only; Redis ← API/worker only; no public inbound to tasks |
+| **Cost (Dev)** | Single NAT; optional `api_desired_count` / `worker_desired_count = 0` until the first image is pushed; no ElastiCache / second NAT / interface endpoints |
 
-- Private subnets for API, worker, and Redis; ALB (and optional CloudFront later for thumbnails) in public subnets.
-- Security groups: ALB → API `:3000`; API/worker → Redis `:6379`, Atlas, S3, SES.
-- Worker needs more CPU/memory and ephemeral disk than API (temp stream files + FFmpeg).
-- CI builds the same multi-stage `Dockerfile`, pushes to ECR, deploys API + worker task definitions with shared env (except `SMTP_HOST` / secrets).
-- Health: ALB target group on `GET /health`; worker relies on ECS health + BullMQ metrics / `GET /api/videos/queue`.
+Module layout: `networking`, `security`, `iam`, `ecr`, `alb`, `ecs`, `redis` (+ remote-state `bootstrap`). See [`infra/terraform/README.md`](infra/terraform/README.md).
 
-This is a **target architecture sketch** for production; the runnable path in this project remains `docker compose up --build`.
+### Compose → AWS mapping
+
+| Local Compose | AWS (Terraform Dev) |
+|---------------|---------------------|
+| `api` | ECS Fargate service behind ALB |
+| `worker` | Separate Fargate service; concurrency **1** preserved in app config |
+| `redis` | Fargate Redis + Cloud Map (not ElastiCache — lower Dev cost) |
+| `mailhog` | Real SMTP / SES via `SMTP_*` |
+| `.env` secrets | Secrets Manager → ECS injection |
+| Host networking | Private subnets + NAT for Atlas/HTTPS; S3 via gateway endpoint |
+
+### Deploy outline
+
+1. Create Secrets Manager secrets (JSON keys `MONGODB_URI`, `JWT_SECRET`, …) and set ARNs in `environments/dev/terraform.tfvars`.
+2. `terraform init` / `plan` / `apply` from `infra/terraform/environments/dev` (only when authorized).
+3. Build and push the multi-stage `Dockerfile` to ECR with the configured **immutable** `image_tag` (e.g. `dev-initial`).
+4. Raise API/worker desired counts if they were started at `0`.
+5. Hit the stack via the ALB DNS (`GET /health`).
+
+**Production follow-ups (intentionally out of Dev):** ACM + HTTPS listener, tighten Atlas Network Access / Mongo egress CIDRs, consider ElastiCache, scale API horizontally while keeping a single worker consumer.
 
 ## End-to-end flow
 
@@ -530,4 +567,5 @@ src/
 docker-compose.yml        # api, redis, worker, mailhog
 Dockerfile                # Node image + ffmpeg/ffprobe
 .env.example
+infra/terraform/          # AWS Dev IaC (VPC, ALB, ECS, ECR, IAM, Redis)
 ```

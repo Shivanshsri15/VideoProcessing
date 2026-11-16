@@ -71,14 +71,6 @@ resource "aws_vpc_security_group_ingress_rule" "api_from_alb" {
   ip_protocol                  = "tcp"
 }
 
-resource "aws_vpc_security_group_egress_rule" "api_to_worker" {
-  security_group_id = aws_security_group.api.id
-
-  description                  = "Allow API to communicate with workers."
-  referenced_security_group_id = aws_security_group.worker.id
-  ip_protocol                  = "-1"
-}
-
 resource "aws_vpc_security_group_egress_rule" "api_to_redis" {
   security_group_id = aws_security_group.api.id
 
@@ -96,6 +88,16 @@ resource "aws_vpc_security_group_egress_rule" "api_https" {
   cidr_ipv4   = "0.0.0.0/0"
   from_port   = 443
   to_port     = 443
+  ip_protocol = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "api_mongodb" {
+  security_group_id = aws_security_group.api.id
+
+  description = "Allow API outbound MongoDB Atlas (TCP ${var.mongodb_port})."
+  cidr_ipv4   = "0.0.0.0/0"
+  from_port   = var.mongodb_port
+  to_port     = var.mongodb_port
   ip_protocol = "tcp"
 }
 
@@ -133,6 +135,16 @@ resource "aws_vpc_security_group_egress_rule" "worker_https" {
   ip_protocol = "tcp"
 }
 
+resource "aws_vpc_security_group_egress_rule" "worker_mongodb" {
+  security_group_id = aws_security_group.worker.id
+
+  description = "Allow worker outbound MongoDB Atlas (TCP ${var.mongodb_port})."
+  cidr_ipv4   = "0.0.0.0/0"
+  from_port   = var.mongodb_port
+  to_port     = var.mongodb_port
+  ip_protocol = "tcp"
+}
+
 # --------------------------------------------------
 # Redis Security Group
 # --------------------------------------------------
@@ -165,4 +177,14 @@ resource "aws_vpc_security_group_ingress_rule" "redis_from_worker" {
   from_port                    = var.redis_port
   to_port                      = var.redis_port
   ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "redis_https" {
+  security_group_id = aws_security_group.redis.id
+
+  description = "Allow Redis task outbound HTTPS for ECR pulls and CloudWatch logs via NAT."
+  cidr_ipv4   = "0.0.0.0/0"
+  from_port   = 443
+  to_port     = 443
+  ip_protocol = "tcp"
 }

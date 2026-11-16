@@ -36,6 +36,39 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# Scoped Secrets Manager access for ECS task definition `secrets` injection.
+resource "aws_iam_role_policy" "ecs_execution_secrets" {
+  count = length(var.secrets_manager_secret_arns) > 0 ? 1 : 0
+
+  name = "${local.name_prefix}-ecs-execution-secrets"
+  role = aws_iam_role.ecs_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = var.secrets_manager_secret_arns
+        }
+      ],
+      length(var.kms_key_arns) > 0 ? [
+        {
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt"]
+          Resource = var.kms_key_arns
+          Condition = {
+            StringEquals = {
+              "kms:ViaService" = "secretsmanager.${var.aws_region}.amazonaws.com"
+            }
+          }
+        }
+      ] : []
+    )
+  })
+}
+
 # --------------------------------------------------
 # API TASK ROLE
 # Used by the NestJS API application.

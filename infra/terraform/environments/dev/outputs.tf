@@ -62,3 +62,13 @@ output "worker_task_role_arn" {
   description = "Worker task role ARN."
   value       = module.iam.worker_task_role_arn
 }
+
+output "redis_endpoint" {
+  description = "Internal Redis endpoint."
+  value       = module.redis.redis_endpoint
+}
+
+output "redis_port" {
+  description = "Redis port."
+  value       = module.redis.redis_port
+}

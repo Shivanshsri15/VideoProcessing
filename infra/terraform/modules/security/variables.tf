@@ -26,6 +26,12 @@ variable "redis_port" {
   default     = 6379
 }
 
+variable "mongodb_port" {
+  description = "MongoDB Atlas TCP port for API/worker egress."
+  type        = number
+  default     = 27017
+}
+
 variable "tags" {
   description = "Common tags applied to security groups."
   type        = map(string)
