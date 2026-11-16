@@ -1,6 +1,6 @@
 # Video Processing Platform
 
-API-only NestJS backend for authenticated video upload, async FFmpeg processing (one job at a time), AWS S3 storage, and task status APIs.
+API-only NestJS backend for authenticated video upload and asynchronous FFmpeg processing. Clients upload videos to S3; a BullMQ worker streams each file through encode + thumbnail generation, then updates task status in MongoDB/Redis and emails the owner on completion or final failure. The same Docker image runs locally via Compose and on AWS (Terraform → ECS Fargate, ALB, Secrets Manager).
 
 ## Table of contents
 
@@ -9,6 +9,7 @@ API-only NestJS backend for authenticated video upload, async FFmpeg processing 
 - [Architecture](#architecture)
 - [Cloud deployment (AWS)](#cloud-deployment-aws)
 - [End-to-end flow](#end-to-end-flow)
+- [System design edge cases](#system-design-edge-cases)
 - [Prerequisites](#prerequisites)
 - [Setup and run](#setup-and-run)
 - [Environment variables](#environment-variables)
@@ -153,6 +154,110 @@ sequenceDiagram
   C->>A: GET progress or thumbnail
   A-->>C: progress or JPEG
 ```
+
+## System design edge cases
+
+Happy-path APIs are not enough for a reliable media pipeline. The behaviors below are intentional design choices for auth abuse, partial S3 I/O, queue retries, and notification side effects.
+
+### At a glance
+
+| Edge case | Design response |
+|-----------|-----------------|
+| Stolen / reused JWT after logout | Redis **`jti` denylist** until token `exp` |
+| Password change with multiple sessions | Bump Mongo **`tokenVersion`**; guard rejects stale `tv` |
+| Auth / upload abuse | Redis-backed **rate limits** (IP or user scoped) |
+| Mid-flight S3 download failure | Keep partial temp file; **Range resume** on retry |
+| Corrupt / oversized partial download | Delete local file; full re-download |
+| Transient FFmpeg / S3 upload failure | BullMQ **3 attempts**, exponential backoff; keep complete `input` |
+| Final processing failure | Mark `failed`, **delete S3 orphans** (`output.mp4` / `thumb.jpg`), keep original |
+| Missing task document | **`UnrecoverableError`** — no retries |
+| Duplicate enqueue for same upload | BullMQ **`jobId = taskId`** |
+| Email after retry storm | Notify only on **terminal** status; **`emailNotifiedAt`** idempotency |
+| SMTP outage after successful encode | Log only — **does not** fail the job or flip task status |
+| Status read under load | Redis status cache; Mongo remains source of truth; **owner check** always |
+
+### Auth: `jti` denylist + `tokenVersion`
+
+Access tokens carry `jti` (unique JWT ID) and `tv` (token version). Every authenticated request:
+
+1. Reject if `jwt:deny:<jti>` exists in Redis (logout / password-change of that token).
+2. Reject if `tv` ≠ current `users.tokenVersion` (global session invalidation).
+
+```mermaid
+flowchart TB
+  Req[Bearer_JWT] --> Deny{"jti denylisted?"}
+  Deny -->|yes| Unauthorized[401]
+  Deny -->|no| Version{"tv equals user.tokenVersion?"}
+  Version -->|no| Unauthorized
+  Version -->|yes| Allow[Proceed]
+  Logout[POST_logout] --> DenyOne["SET jwt:deny:jti TTL=exp"]
+  ChangePw[POST_change_password] --> Bump["tokenVersion += 1"]
+  ChangePw --> DenyOne
+```
+
+| Scenario | Sessions affected |
+|----------|-------------------|
+| Logout | **This** token only (other devices keep working) |
+| Change password | **All** older tokens fail via `tokenVersion`; current `jti` also denylisted |
+
+### Rate limiting
+
+| Surface | Keyed by | Limit |
+|---------|----------|--------|
+| Register / login | Client IP | 10 / min |
+| Change password / logout | Authenticated user id | 20 / min |
+| Video upload | Authenticated user id | 5 / min |
+| Default API | Client IP | 60 / min (`THROTTLE_*`) |
+
+Authenticated throttles use a user-scoped guard (JWT runs first) so limits cannot be bypassed by rotating IPs after login.
+
+### Failed download + Range resume
+
+Worker downloads are streamed to `tmpdir()/process-{taskId}/input`. On a later BullMQ attempt:
+
+```mermaid
+flowchart TD
+  Head[HeadObject_expected_size] --> Compare{local_size_vs_expected}
+  Compare -->|equal| Skip[Skip_download]
+  Compare -->|0_lt_size_lt_expected| Range["GET Range bytes=N- append"]
+  Compare -->|size_gt_expected| Wipe[Unlink_partial_restart]
+  Compare -->|missing| Full[GET_full_object]
+  Range --> Verify{final_size_equals_expected?}
+  Full --> Verify
+  Wipe --> Full
+  Verify -->|no| Fail[Throw_retryable_error]
+  Verify -->|yes| FFmpeg[Continue_pipeline]
+```
+
+Streaming is low-RAM I/O, not pipelined encode-while-downloading — FFmpeg still needs a complete seekable file.
+
+### Retries, orphans, and terminal failure
+
+| Attempt outcome | Mongo status | Temp disk | S3 artifacts |
+|-----------------|--------------|-----------|--------------|
+| Transient error (attempt 1–2) | stays `processing` | keep `input`; drop temp outputs | no orphan delete yet |
+| Success | `completed` | wipe work dir | original + `output.mp4` + `thumb.jpg` |
+| Final attempt failed | `failed` + `failureReason` | wipe work dir | delete orphaned outputs; **keep** original upload |
+| Task id missing | n/a | n/a | `UnrecoverableError` (no backoff retries) |
+
+- **Attempts:** 3 (`PROCESS_JOB_ATTEMPTS`)
+- **Backoff:** exponential from 5s → ~5s / 10s / 20s
+- **Idempotent job key:** `jobId = taskId` avoids duplicate queue entries for the same upload
+- No public “retry failed task” API — client uploads again for a new `taskId`
+
+### Email edge cases
+
+| Situation | Behavior |
+|-----------|----------|
+| Job succeeds | Email owner; set `emailNotifiedAt` |
+| Job fails on **final** attempt only | Email failure outcome; set `emailNotifiedAt` |
+| Intermediate retry failure | **No** email (status not terminal yet) |
+| `emailNotifiedAt` already set | Skip send (idempotent) |
+| SMTP error after encode success | Log; task remains `completed` |
+
+### Cache vs ownership
+
+Status/progress GETs may hit Redis `task:status:{taskId}` first, but **ownership is always enforced** against the authenticated user. Cache miss → Mongo → refill cache. A user cannot read another user’s task by guessing ids.
 
 ## Prerequisites
 
