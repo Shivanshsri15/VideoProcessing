@@ -35,6 +35,8 @@ infra/terraform/
 
 ## Architecture (Dev)
 
+![Video Processing AWS architecture](../../docs/video-processing-aws-architecture.jpg)
+
 - **Ingress:** ALB `:80` → API tasks on `:3000` (private). HTTPS when `acm_certificate_arn` is set.
 - **Egress:** API/worker → Redis (SG-to-SG), MongoDB Atlas (`27017`), HTTPS (NAT), S3 (gateway endpoint).
 - **Image:** `{account}.dkr.ecr.ap-south-1.amazonaws.com/video-processing-dev:{image_tag}`

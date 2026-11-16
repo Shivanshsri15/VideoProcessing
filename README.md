@@ -79,38 +79,9 @@ Infrastructure-as-code under [`infra/terraform`](infra/terraform) provisions a *
 
 ### Architecture
 
-```mermaid
-flowchart TB
-  Clients[Clients] --> ALB[ALB_HTTP_80]
-  ALB -->|health_/health| API[ECS_Fargate_API]
-  subgraph vpc [VPC]
-    subgraph public [Public_subnets]
-      ALB
-      NAT[Single_NAT_Gateway]
-    end
-    subgraph private [Private_app_subnets]
-      API
-      Worker[ECS_Fargate_Worker]
-      Redis[ECS_Fargate_Redis]
-      CM[Cloud_Map_DNS]
-    end
-    S3GW[S3_Gateway_VPC_Endpoint]
-  end
-  API --> Atlas[(MongoDB_Atlas)]
-  Worker --> Atlas
-  API --> Redis
-  Worker --> Redis
-  Redis --> CM
-  API --> S3[Existing_S3_bucket]
-  Worker --> S3
-  API --> SM[Secrets_Manager]
-  Worker --> SM
-  ECR[ECR_immutable_tags] --> API
-  ECR --> Worker
-  NAT --> Atlas
-  NAT --> SM
-  S3GW --> S3
-```
+![Video Processing AWS architecture](docs/video-processing-aws-architecture.jpg)
+
+*Dev stack in `ap-south-1`: ALB → ECS Fargate API / worker / Redis (Cloud Map), S3 via Gateway VPC Endpoint, Secrets Manager, ECR, CloudWatch, MongoDB Atlas via NAT.*
 
 ### What Terraform builds
 
@@ -568,4 +539,5 @@ docker-compose.yml        # api, redis, worker, mailhog
 Dockerfile                # Node image + ffmpeg/ffprobe
 .env.example
 infra/terraform/          # AWS Dev IaC (VPC, ALB, ECS, ECR, IAM, Redis)
+docs/                     # Architecture diagrams (AWS cloud deployment)
 ```
